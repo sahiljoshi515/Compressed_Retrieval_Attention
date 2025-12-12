@@ -13,7 +13,7 @@ from transformers.models.llama.modeling_llama import LlamaDecoderLayer
 import flashinfer
 
 from .utils import apply_rotary_pos_emb, layer_norm, topp_temperature_decode
-from .attnserver import LSHSparseAttnServer, AttnServer
+from .attnserver import LSHSparseAttnServer, AttnServer, DenseAttnServer
 
 
 @dataclass
@@ -123,26 +123,18 @@ class LLM:
 
         # Attention server
         if use_lsh_server and K > 0:
-            self.attention_server = LSHSparseAttnServer(
-                config=self.config,
-                K=K,
-                L=L,
-                batch_size=batch_size,
-                max_length=max_length,
-                generation_buffer=generation_buffer,
-                device=device,
-                dtype=dtype,
-            )
+            # TODO: plug in your sparse server later
+            raise NotImplementedError("Sparse attention server not wired yet. Set use_lsh_server=False for dense.")
         else:
-            self.attention_server = AttnServer(
-                config=self.config,
-                K=K,
-                L=L,
-                batch_size=batch_size,
-                max_length=max_length,
-                generation_buffer=generation_buffer,
-                device=device,
-                dtype=dtype,
+            self.attention_server = DenseAttnServer(
+                num_layers=self.num_layers,
+                batch_size=self.batch_size,
+                num_attention_heads=self.num_heads,
+                num_key_value_heads=self.num_key_value_heads,
+                head_dim=self.head_dim,
+                max_length=self.max_length,
+                device=self.device,
+                dtype=self.dtype,
             )
 
         # Global KV caches for dense prefill (FlashInfer prefill kernel uses these)
