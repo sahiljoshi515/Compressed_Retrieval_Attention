@@ -1,1 +1,11 @@
+# Core
+torch>=2.1.0
+transformers>=4.40.0
+accelerate>=0.28.0
 
+# FlashInfer (dense prefill + decode)
+flashinfer>=0.1.6
+
+# Utilities
+numpy>=1.24
+tqdm>=4.66.0
