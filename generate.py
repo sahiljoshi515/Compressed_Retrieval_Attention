@@ -1,8 +1,3 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-
-# This source code is licensed under the license found in the
-# LICENSE file in the root directory of this source tree.
 import sys
 import time
 from pathlib import Path
@@ -272,7 +267,7 @@ def main(
             # only print on rank 0
             print = lambda *args, **kwargs: None
 
-    device = 'cuda:0'
+    device = 'cuda'
     precision = torch.bfloat16
     is_speculative = draft_checkpoint_path is not None
     is_chat = "chat" in str(checkpoint_path)
