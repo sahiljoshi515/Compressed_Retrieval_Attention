@@ -4,7 +4,11 @@ from pathlib import Path
 from typing import Optional, Tuple
 import itertools
 import torch
-
+from torch.nn.attention import sdpa_kernel, SDPBackend
+import os, sys
+REPO_ROOT = os.path.abspath(os.path.dirname(__file__))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
 import torch._inductor.config
 import torch._dynamo.config
 torch._inductor.config.coordinate_descent_tuning = True
@@ -52,19 +56,47 @@ def decode_one_token(model: Transformer, x: torch.Tensor, input_pos: torch.Tenso
     logits = model(x, input_pos)
     return sample(logits, **sampling_kwargs)
 
-def decode_n_tokens(model: Transformer, cur_token: torch.Tensor, input_pos: torch.Tensor, num_new_tokens: int, callback=lambda _: _, **sampling_kwargs):
+def sparse_decode_one_token(model: Transformer, x: torch.Tensor, input_pos: torch.Tensor, **sampling_kwargs) -> Tuple[torch.Tensor, torch.Tensor]:
+    # input_pos: [B, 1]
+    assert input_pos.shape[-1] == 1
+    logits = model.sparse_forward(x, input_pos)
+    return sample(logits, **sampling_kwargs)
+
+
+def decode_n_tokens(
+    model: Transformer,
+    cur_token: torch.Tensor,
+    input_pos: torch.Tensor,
+    num_new_tokens: int,
+    callback=lambda _: _,
+    decode_type: str = "dense",   # "dense" | "sparse"
+    **sampling_kwargs
+):
     new_tokens, new_probs = [], []
-    for i in range(num_new_tokens):
-        with torch.backends.cuda.sdp_kernel(enable_flash=False, enable_mem_efficient=False, enable_math=True): # Actually better for Inductor to codegen attention here
-            next_token, next_prob = decode_one_token(
-                model, cur_token, input_pos, **sampling_kwargs
-            )
+
+    for _ in range(num_new_tokens):
+        if decode_type == "dense":
+            # Dense path
+            with sdpa_kernel([SDPBackend.MATH]):
+                next_token, next_prob = decode_one_token(
+                    model, cur_token, input_pos, **sampling_kwargs
+                )
+        else:
+            with sdpa_kernel([ SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH, ]):
+                next_token, next_prob = sparse_decode_one_token(
+                    model, cur_token, input_pos, **sampling_kwargs
+                )
+
         input_pos += 1
-        new_tokens.append(next_token.clone())
-        callback(new_tokens[-1])
-        new_probs.append(next_prob.clone())
-        # cur_token = next_token.view(1, -1)
-        cur_token = next_token.clone()
+        next_token = next_token.clone()
+        next_prob = next_prob.clone()
+
+        new_tokens.append(next_token)
+        new_probs.append(next_prob)
+        callback(next_token)
+
+        cur_token = next_token
+
     return new_tokens, new_probs
 
 
@@ -82,7 +114,7 @@ def speculative_decode(
     # draft model inference sequentially
     device = cur_token.device
     orig_input_pos = torch.tensor([input_pos], dtype=torch.int64, device=cur_token.device)
-    draft_tokens, draft_probs = decode_n_tokens(draft_model, cur_token.view(1, -1), orig_input_pos.clone(), speculate_k, **sampling_kwargs)
+    draft_tokens, draft_probs = decode_n_tokens(draft_model, cur_token.view(1, -1), orig_input_pos.clone(), speculate_k, decode_type="dense", **sampling_kwargs)
 
     draft_tokens = torch.cat(draft_tokens)
     # parallel inference on target model using draft tokens
@@ -163,6 +195,8 @@ def generate(
     input_pos = torch.arange(0, T, device=device)
 
     next_token = prefill(model, prompt, input_pos, **sampling_kwargs)
+    # model.build_tables(prefill_len=prompt.size(1))
+
     if is_speculative:
         prefill(draft_model, prompt, input_pos, **sampling_kwargs)
     print(next_token)
@@ -188,7 +222,7 @@ def generate(
             input_pos = input_pos + num_added
             next_token = next_tokens[-1]
     else:
-        generated_tokens, _ = decode_n_tokens(model, next_token, input_pos, max_new_tokens - 1, callback=callback, **sampling_kwargs)
+        generated_tokens, _ = decode_n_tokens(model, next_token, input_pos, max_new_tokens - 1, callback=callback, decode_type="sparse", **sampling_kwargs)
         seq[:,T + 1:] = torch.cat(generated_tokens, dim=1)
 
     generate_stats = {
@@ -205,9 +239,11 @@ def encode_tokens(tokenizer, string, batch_size, bos=True, device='cuda'):
     return batch_tokens_tensor
 
 def _load_model(checkpoint_path, device, precision, use_tp):
-    with torch.device('meta'):
+    # 1) build on meta
+    with torch.device("meta"):
         model = Transformer.from_name(checkpoint_path.parent.name)
 
+    # 2) keep your quantization path exactly (meta-safe module surgery)
     if "int8" in str(checkpoint_path):
         print("Using int8 weight-only quantization!")
         from quantize import WeightOnlyInt8QuantHandler
@@ -223,16 +259,40 @@ def _load_model(checkpoint_path, device, precision, use_tp):
         simple_quantizer = WeightOnlyInt4QuantHandler(model, groupsize)
         model = simple_quantizer.convert_for_runtime()
 
-    checkpoint = torch.load(str(checkpoint_path), mmap=True, weights_only=True)
-    model.load_state_dict(checkpoint, assign=True)
+    # 3) materialize meta tensors on the real device (this is the critical fix)
+    model = model.to_empty(device=device)
 
+    # 4) load checkpoint (CPU -> assign into already-materialized tensors)
+    checkpoint = torch.load(str(checkpoint_path), mmap=True, weights_only=True, map_location="cpu")
+    missing, unexpected = model.load_state_dict(checkpoint, strict=False)
+
+    if missing:
+        print("Missing keys (expected for new hash buffers):", missing[:5], "..." if len(missing) > 5 else "")
+    if unexpected:
+        print("Unexpected keys:", unexpected[:5], "..." if len(unexpected) > 5 else "")
+
+    # 5) initialize any newly-added hash tensors that aren't in the ckpt
+    #    (IMPORTANT: to_empty leaves them uninitialized garbage)
+    needs_hash_init = any(("planes" in k) or ("protos_T" in k) for k in missing)
+    if needs_hash_init:
+        for m in model.modules():
+            # if you registered these as buffers:
+            if hasattr(m, "planes") and isinstance(m.planes, torch.Tensor):
+                m.planes.normal_(mean=0.0, std=0.02)
+            if hasattr(m, "protos_T") and isinstance(m.protos_T, torch.Tensor):
+                m.protos_T.normal_(mean=0.0, std=0.02)
+
+    # 6) tensor parallel after weights are in place
     if use_tp:
         from tp import apply_tp
         print("Applying tensor parallel to model ...")
         apply_tp(model)
 
-    model = model.to(device=device, dtype=precision)
+    # 7) cast dtype (DON'T pass device here; it's already on device)
+    model = model.to(dtype=precision)
+
     return model.eval()
+
 
 B_INST, E_INST = "[INST]", "[/INST]"
 
@@ -396,7 +456,7 @@ if __name__ == '__main__':
     parser.add_argument('--prompt', type=str, default="Hello, my name is", help='Input prompt.')
     parser.add_argument('--interactive', action='store_true', help='Whether to launch in interactive mode')
     parser.add_argument('--num_samples', type=int, default=1, help='Number of samples.')
-    parser.add_argument('--max_new_tokens', type=int, default=200, help='Maximum number of new tokens.')
+    parser.add_argument('--max_new_tokens', type=int, default=20, help='Maximum number of new tokens.')
     parser.add_argument('--top_k', type=int, default=200, help='Top-k for sampling.')
     parser.add_argument('--temperature', type=float, default=0.8, help='Temperature for sampling.')
     parser.add_argument('--checkpoint_path', type=Path, default=Path("/scratch/sj157/Compressed_Retrieval_Attention/checkpoints/meta-llama/Llama-2-7b-chat-hf/model.pth"), help='Model checkpoint path.')
