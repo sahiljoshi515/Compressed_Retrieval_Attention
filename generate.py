@@ -45,9 +45,12 @@ def sample(logits, temperature: float = 1.0, top_k: Optional[int] = None):
     idx_next = torch.argmax(probs, dim=-1, keepdim=True).to(dtype=torch.int) # TODO: change the sampling method
     return idx_next, probs
 
-def prefill(model: Transformer, x: torch.Tensor, input_pos: torch.Tensor, **sampling_kwargs) -> torch.Tensor:
+def prefill(model: Transformer, x: torch.Tensor, input_pos: torch.Tensor, decode_type: str, **sampling_kwargs) -> torch.Tensor:
     # input_pos: [B, S]
-    logits = model(x, input_pos)
+    if decode_type == "dense":
+        logits = model(x, input_pos)
+    else:
+        logits = model.sparse_forward(x, input_pos)
     return sample(logits, **sampling_kwargs)[0]
 
 def decode_one_token(model: Transformer, x: torch.Tensor, input_pos: torch.Tensor, **sampling_kwargs) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -194,12 +197,34 @@ def generate(
     # TODO: All sequences share the same position for now
     input_pos = torch.arange(0, T, device=device)
 
-    next_token = prefill(model, prompt, input_pos, **sampling_kwargs)
+    # --- Timing: prefill vs decode ---
+    # We use CUDA events to avoid CPU-side noise. Synchronize boundaries so the split is clean.
+    use_cuda_timing = (device.type == "cuda")
+    if use_cuda_timing:
+        prefill_start_evt = torch.cuda.Event(enable_timing=True)
+        prefill_end_evt = torch.cuda.Event(enable_timing=True)
+        decode_start_evt = torch.cuda.Event(enable_timing=True)
+        decode_end_evt = torch.cuda.Event(enable_timing=True)
+
+        torch.cuda.synchronize()
+        prefill_start_evt.record()
+    else:
+        prefill_start_t = time.perf_counter()
+
+    next_token = prefill(model, prompt, input_pos, "dense", **sampling_kwargs)
     # model.build_tables(prefill_len=prompt.size(1))
 
     if is_speculative:
-        prefill(draft_model, prompt, input_pos, **sampling_kwargs)
-    print(next_token)
+        prefill(draft_model, prompt, input_pos, "dense", **sampling_kwargs)
+
+    if use_cuda_timing:
+        prefill_end_evt.record()
+        torch.cuda.synchronize()
+        prefill_time_s = prefill_start_evt.elapsed_time(prefill_end_evt) / 1e3
+        decode_start_evt.record()
+    else:
+        prefill_time_s = time.perf_counter() - prefill_start_t
+        decode_start_t = time.perf_counter()
     seq[:,T] = next_token[:,0]
 
     input_pos = torch.tensor([T], device=device, dtype=torch.int)
@@ -222,11 +247,24 @@ def generate(
             input_pos = input_pos + num_added
             next_token = next_tokens[-1]
     else:
-        generated_tokens, _ = decode_n_tokens(model, next_token, input_pos, max_new_tokens - 1, callback=callback, decode_type="sparse", **sampling_kwargs)
+        generated_tokens, _ = decode_n_tokens(model, next_token, input_pos, max_new_tokens - 1, callback=callback, decode_type="dense", **sampling_kwargs)
         seq[:,T + 1:] = torch.cat(generated_tokens, dim=1)
 
+    if use_cuda_timing:
+        decode_end_evt.record()
+        torch.cuda.synchronize()
+        decode_time_s = decode_start_evt.elapsed_time(decode_end_evt) / 1e3
+    else:
+        decode_time_s = time.perf_counter() - decode_start_t
+
+    # Decode-only tokens exclude the first token produced by prefill.
+    decode_only_tokens = batch_size * max(0, max_new_tokens - 1)
+
     generate_stats = {
-        'accept_counts': accept_counts
+        'accept_counts': accept_counts,
+        'prefill_time_s': prefill_time_s,
+        'decode_time_s': decode_time_s,
+        'decode_only_tokens': decode_only_tokens,
     }
     return seq, generate_stats
 
@@ -298,9 +336,10 @@ B_INST, E_INST = "[INST]", "[/INST]"
 
 def main(
     prompt: str = "Hello, my name is",
+    prompt_file: Optional[Path] = None,
     interactive: bool = False,
     num_samples: int = 5,
-    max_new_tokens: int = 100,
+    max_new_tokens: int = 1000,
     top_k: int = 200,
     temperature: float = 0.8,
     checkpoint_path: Path = Path("checkpoints/meta-Transformer/Transformer-2-7b-chat-hf/model.pth"),
@@ -345,6 +384,9 @@ def main(
     print(f"Time to load model: {time.time() - t0:.02f} seconds")
 
     tokenizer = SentencePieceProcessor(model_file=str(tokenizer_path))
+
+    if (prompt_file is not None) and (not interactive):
+        prompt = Path(prompt_file).read_text(encoding="utf-8")
     encoded = encode_tokens(tokenizer, prompt, batch_size=batch_size, bos=True, device=device)
     prompt_length = encoded.size(1)
 
@@ -438,6 +480,15 @@ def main(
         aggregate_metrics['tokens_per_sec'].append(tokens_sec)
         print(f"Time for inference {i + 1}: {t:.02f} sec total, {tokens_sec:.02f} tokens/sec")
         print(f"Bandwidth achieved: {model_size * tokens_sec / 1e9:.02f} GB/s")
+        if metrics.get('decode_time_s', None) is not None:
+            decode_time_s = metrics['decode_time_s']
+            decode_only_tokens = metrics.get('decode_only_tokens', None)
+            if decode_only_tokens is None:
+                # Fallback if older metrics dict is used
+                decode_only_tokens = batch_size * max(0, (y.size(1) - prompt_length - 1))
+            if decode_time_s > 0:
+                print(f"Decode-only: {decode_time_s:.04f} sec, {decode_only_tokens / decode_time_s:.02f} tokens/sec")
+            print(f"Prefill: {metrics.get('prefill_time_s', 0.0):.04f} sec")
     print("==========")
     if is_speculative:
         counts_aggregated = [sum(i) for i in zip(*aggregate_metrics['accept_counts'])]
@@ -454,9 +505,10 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Your CLI description.')
 
     parser.add_argument('--prompt', type=str, default="Hello, my name is", help='Input prompt.')
+    parser.add_argument('--prompt_file', type=Path, default=None, help='Path to a text file containing the prompt (avoids argument length limits).')
     parser.add_argument('--interactive', action='store_true', help='Whether to launch in interactive mode')
     parser.add_argument('--num_samples', type=int, default=1, help='Number of samples.')
-    parser.add_argument('--max_new_tokens', type=int, default=20, help='Maximum number of new tokens.')
+    parser.add_argument('--max_new_tokens', type=int, default=10000, help='Maximum number of new tokens.')
     parser.add_argument('--top_k', type=int, default=200, help='Top-k for sampling.')
     parser.add_argument('--temperature', type=float, default=0.8, help='Temperature for sampling.')
     parser.add_argument('--checkpoint_path', type=Path, default=Path("/scratch/sj157/Compressed_Retrieval_Attention/checkpoints/meta-llama/Llama-2-7b-chat-hf/model.pth"), help='Model checkpoint path.')
@@ -469,6 +521,18 @@ if __name__ == '__main__':
 
     args = parser.parse_args()
     main(
-        args.prompt, args.interactive, args.num_samples, args.max_new_tokens, args.top_k,
-        args.temperature, args.checkpoint_path, args.compile, args.compile_prefill, args.profile, args.draft_checkpoint_path, args.speculate_k, args.batch_size
+        prompt=args.prompt,
+        prompt_file=args.prompt_file,
+        interactive=args.interactive,
+        num_samples=args.num_samples,
+        max_new_tokens=args.max_new_tokens,
+        top_k=args.top_k,
+        temperature=args.temperature,
+        checkpoint_path=args.checkpoint_path,
+        compile=args.compile,
+        compile_prefill=args.compile_prefill,
+        profile=args.profile,
+        draft_checkpoint_path=args.draft_checkpoint_path,
+        speculate_k=args.speculate_k,
+        batch_size=args.batch_size,
     )

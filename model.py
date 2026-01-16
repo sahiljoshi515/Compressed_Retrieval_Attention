@@ -12,7 +12,7 @@ REPO_ROOT = os.path.abspath(os.path.dirname(__file__))
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
     
-from kernels.sparse import fwd_sparse_kernel, fwd_sparse_no_mask
+from kernels.sparse import build_sparse_list_decode, sparse_attention_fwd
 
 def find_multiple(n: int, k: int) -> int:
     if n % k == 0:
@@ -31,11 +31,10 @@ class ModelArgs:
     head_dim: int = 64
     rope_base: float = 40000
     norm_eps: float = 1e-5
-    L: int = 5       
-    R: int = 16      
-    top_t: int = 4
-    K: int = 4
-    heavy_const: int = 128   # budget
+    L: int = 60       
+    R: int = 1024      
+    K: int = 10
+    heavy_const: int = 64   # budget
 
     def __post_init__(self):
         if self.n_local_heads == -1:
@@ -67,7 +66,7 @@ transformer_configs = {
 
 class KVCache(nn.Module):
     def __init__(self, max_batch_size, max_seq_length, n_heads, head_dim,
-                 L=5, R=16, dtype=torch.bfloat16):
+                 L, R, dtype=torch.bfloat16):
         super().__init__()
         B, T, H, D = max_batch_size, max_seq_length, n_heads, head_dim
 
@@ -79,21 +78,8 @@ class KVCache(nn.Module):
         self.R = R
         self.register_buffer("k_hard", torch.zeros((max_batch_size, max_seq_length, n_heads, L), dtype=torch.int16))
         self.register_buffer("v_norm", torch.zeros((max_batch_size, max_seq_length, n_heads), dtype=torch.float16))
-
-        # CSR: offsets + packed positions
-        self.register_buffer("bucket_offsets", torch.zeros((max_batch_size, n_heads, L, R + 1), dtype=torch.int32))
-        self.register_buffer("bucket_indices", torch.full((max_batch_size, n_heads, L, max_seq_length), -1, dtype=torch.int32))
-        self.register_buffer("csr_built_upto", torch.zeros((), dtype=torch.int32))
         self.register_buffer('attn_out', torch.zeros((max_batch_size, n_heads, head_dim), dtype=dtype))
-
         self.register_buffer("prefill_len", torch.zeros((), dtype=torch.int32))
-
-        # per-bucket append lists for tokens generated AFTER prefill
-        self.register_buffer("dec_counts", torch.zeros((B, H, L, R), dtype=torch.int32))
-        self.register_buffer(
-            "dec_indices",
-            torch.full((B, H, L, R, T), -1, dtype=torch.int32)  # you can use int16 if T<=32767
-        )
 
 
     def append_decode_pos(self, b: int, h: int, l: int, r: int, t: int):
@@ -146,7 +132,14 @@ class Transformer(nn.Module):
         self.max_seq_length = max_seq_length
         self.max_batch_size = max_batch_size
         for b in self.layers:
-            b.attention.kv_cache = KVCache(max_batch_size, max_seq_length, self.config.n_local_heads, head_dim)
+            b.attention.kv_cache = KVCache(
+                max_batch_size,
+                max_seq_length,
+                self.config.n_local_heads,
+                head_dim,
+                L=self.config.L,
+                R=self.config.R,
+            )
 
         self.freqs_cis = precompute_freqs_cis(self.config.block_size, self.config.dim // self.config.n_head, self.config.rope_base)
         self.causal_mask = torch.tril(torch.ones(self.max_seq_length, self.max_seq_length, dtype=torch.bool))
@@ -218,7 +211,6 @@ class Attention(nn.Module):
         self.config = config
         self.L = config.L
         self.R = config.R
-        self.top_t = config.top_t
         self.K = config.K
         self.heavy_const = config.heavy_const
         
@@ -273,18 +265,159 @@ class Attention(nn.Module):
         codes = self.pack_bits(bits)  # [B,T,H,L]
         return codes.to(torch.int16)
 
+    # def sparse_forward(
+    #     self,
+    #     x: torch.Tensor,
+    #     freqs_cis: torch.Tensor,
+    #     mask1: torch.Tensor,      # [1,1,S,Tmax] bool
+    #     mask2: torch.Tensor,      # unused
+    #     input_pos: Optional[torch.Tensor] = None,
+    # ) -> torch.Tensor:
+    #     assert input_pos is not None, "sparse_forward expects input_pos"
+    #     bsz, seqlen, _ = x.shape
+    #     assert self.kv_cache is not None, "Call setup_caches() first so kv_cache exists"
+
+    #     kv_size = self.n_local_heads * self.head_dim
+    #     q, k, v = self.wqkv(x).split([self.dim, kv_size, kv_size], dim=-1)
+
+    #     q = q.view(bsz, seqlen, self.n_head, self.head_dim)             # [B,S,H,D]
+    #     k = k.view(bsz, seqlen, self.n_local_heads, self.head_dim)      # [B,S,Hl,D]
+    #     v = v.view(bsz, seqlen, self.n_local_heads, self.head_dim)      # [B,S,Hl,D]
+
+    #     q = apply_rotary_emb(q, freqs_cis)
+    #     k = apply_rotary_emb(k, freqs_cis)
+
+    #     # # Cache updates: write k/v plus k_hard + v_norm for these positions
+    #     # with torch.no_grad():
+    #     #     k_hard = self.hard_hash_keys(k)  # [B,S,Hl,L] int16
+    #     #     v_norm = torch.linalg.vector_norm(v.float(), ord=2, dim=-1).to(torch.float16)  # [B,S,Hl] fp16
+
+    #     # k_cache, v_cache = self.kv_cache.update(input_pos, k, v, v_norm=v_norm, k_hard=k_hard)  # [B,Tmax,Hl,D]
+
+    #     # # Expand local heads -> global heads for dense prefill path only
+    #     # assert self.n_head % self.n_local_heads == 0
+    #     # rep = self.n_head // self.n_local_heads
+
+    #     # SDPA layout tensors for prefill
+    #     q_sdpa = q.transpose(1, 2)  # [B,H,S,D]
+
+    #     if rep == 1:
+    #         k_full = k_cache
+    #         v_full = v_cache
+    #     else:
+    #         k_full = k_cache.repeat_interleave(rep, dim=2)
+    #         v_full = v_cache.repeat_interleave(rep, dim=2)
+
+    #     k_sdpa = k_full.transpose(1, 2)  # [B,H,Tmax,D]
+    #     v_sdpa = v_full.transpose(1, 2)  # [B,H,Tmax,D]
+
+    #     # Prefill/chunked decode: dense attention
+    #     if seqlen != 1:
+    #         y = F.scaled_dot_product_attention(q_sdpa, k_sdpa, v_sdpa, attn_mask=mask1, dropout_p=0.0)
+    #         y = y.transpose(1, 2).contiguous().view(bsz, seqlen, self.dim)
+    #         return self.wo(y)
+
+    #     # -------------------------
+    #     # True decode (S == 1)
+    #     # Backend-only timing path: create a dummy sparse_list.
+    #     # -------------------------
+    #     T = int(self.kv_cache.prefill_len.item())
+    #     assert T > 0
+    #     q_bhd = q_sdpa[:, :, 0, :].contiguous()  # [B,H,D]
+
+    #     # Use the last K positions as the sparse set (cheap + deterministic).
+    #     Ktotal = min(256, T)
+    #     start = max(0, T - Ktotal)
+    #     idx = torch.arange(start, T, device=x.device, dtype=torch.int32)
+    #     sparse_list = idx.view(1, 1, -1).expand(bsz, self.n_head, -1).contiguous()  # [B,H,Ktotal]
+    #     sparse_len = torch.full((bsz, self.n_head), Ktotal, device=x.device, dtype=torch.int32)
+
+    #     # # -------------------------
+    #     # # True decode (S == 1)
+    #     # # -------------------------
+    #     # T = int(self.kv_cache.prefill_len.item())
+    #     # assert T > 0
+
+    #     # # allowed mask for prefix: [B,H,T]
+    #     # allowed_bht = mask1[..., :T].expand(bsz, self.n_head, 1, T).squeeze(2).contiguous()  # bool
+
+    #     # # k_hard/v_norm for prefix:
+    #     # # kv_cache.k_hard: [B,T,Hl,L] -> expand Hl->H -> [B,H,L,T]
+    #     # k_hard_pref = self.kv_cache.k_hard[:, :T]  # [B,T,Hl,L]
+    #     # if rep != 1:
+    #     #     k_hard_pref = k_hard_pref.repeat_interleave(rep, dim=2)  # [B,T,H,L]
+    #     # k_hard_bhlt = k_hard_pref.permute(0, 2, 3, 1).contiguous()   # [B,H,L,T]
+
+    #     # v_norm_pref = self.kv_cache.v_norm[:, :T]  # [B,T,Hl]
+    #     # if rep != 1:
+    #     #     v_norm_pref = v_norm_pref.repeat_interleave(rep, dim=2)  # [B,T,H]
+    #     # v_norm_bht = v_norm_pref.permute(0, 2, 1).contiguous()       # [B,H,T]
+
+    #     # # Query for indexer/backend: [B,H,D]
+    #     # q_bhd = q_sdpa[:, :, 0, :].contiguous()
+
+    #     # # sink/window + heavy M
+    #     # sink = int(getattr(self.config, "sink_size", 128))
+    #     # window = int(getattr(self.config, "window_size", 128))
+    #     # M = int(self.heavy_const)
+    #     # sink = max(0, min(sink, T))
+    #     # window = max(0, min(window, T))
+    #     # M = max(0, min(M, T))
+    #     # q_probs = self.soft_hash(q_bhd)  # [B,H,L,R] fp16
+    #     # # -------------------------
+    #     # # Stage 0: indexer -> sparse_list / sparse_len
+    #     # # -------------------------
+    #     # sparse_list, sparse_len = build_sparse_list_decode(
+    #     #     q_probs,
+    #     #     k_hard_bhlt,
+    #     #     v_norm_bht,
+    #     #     allowed_bht,
+    #     #     sink=sink,
+    #     #     window=window,
+    #     #     M=M,
+    #     #     KC=8,
+    #     #     BLOCK_N=512,
+    #     #     num_warps=8,   # try 8 first for L=60
+    #     #     num_stages=2,
+    #     # )
+
+    #     # # Backend expects int32 indices
+    #     # if sparse_list.dtype != torch.int32:
+    #     #     sparse_list = sparse_list.to(torch.int32)
+    #     # if sparse_len.dtype != torch.int32:
+    #     #     sparse_len = sparse_len.to(torch.int32)
+
+
+    #     k_backend = k_cache[:, :T].permute(0, 2, 1, 3).contiguous()  # [B,Hl,T,D]
+    #     v_backend = v_cache[:, :T].permute(0, 2, 1, 3).contiguous()  # [B,Hl,T,D]
+        
+    #     out_bhd = sparse_attention_fwd(
+    #         q_bhd,            # [B,H,D]
+    #         k_backend,        # [B,Hl,T,D]
+    #         v_backend,        # [B,Hl,T,D]
+    #         sparse_list,      # [B,H,Ktotal]
+    #         sparse_len,       # [B,H]
+    #         block_seq=256,
+    #     )  # [B,H,D]
+
+    #     # Project output
+    #     y = out_bhd.unsqueeze(2)  # [B,H,1,D]
+    #     y = y.transpose(1, 2).contiguous().view(bsz, 1, self.dim)
+    #     return self.wo(y)
+
     def sparse_forward(
         self,
-        x: Tensor,
-        freqs_cis: Tensor,
-        mask1: Tensor,      # [1,1,S,Tmax] bool (causal)
-        mask2: Tensor,      # unused
-        input_pos: Optional[Tensor] = None,
-    ) -> Tensor:
+        x: torch.Tensor,
+        freqs_cis: torch.Tensor,
+        mask1: torch.Tensor,      # [1,1,S,Tmax] bool (for dense prefill)
+        mask2: torch.Tensor,      # unused
+        input_pos: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         assert input_pos is not None, "sparse_forward expects input_pos"
         bsz, seqlen, _ = x.shape
         assert self.kv_cache is not None, "Call setup_caches() first so kv_cache exists"
 
+        # ---- QKV ----
         kv_size = self.n_local_heads * self.head_dim
         q, k, v = self.wqkv(x).split([self.dim, kv_size, kv_size], dim=-1)
 
@@ -295,125 +428,82 @@ class Attention(nn.Module):
         q = apply_rotary_emb(q, freqs_cis)
         k = apply_rotary_emb(k, freqs_cis)
 
-        # ------------------------------------------------------------
-        # Cache updates: write k/v plus hard-hash + vnorm for these S positions only
-        # ------------------------------------------------------------
-        with torch.no_grad():
-            # k_hard: [B,S,Hl,L], v_norm: [B,S,Hl]
-            k_hard = self.hard_hash_keys(k)
-            v_norm = torch.linalg.vector_norm(v.float(), ord=2, dim=-1).to(torch.float16)
+        # ---- KV cache update (NO hashing) ----
+        # Assumes kv_cache.update can be called without v_norm/k_hard.
+        # If your update() requires those args, make them optional in kv_cache.update.
+        k_cache, v_cache = self.kv_cache.update(input_pos, k, v)  # [B,Tmax,Hl,D]
 
-        k_cache, v_cache = self.kv_cache.update(input_pos, k, v, v_norm=v_norm, k_hard=k_hard)  # [B,Tmax,Hl,D]
-
-        # Expand local heads -> global heads
-        rep = self.n_head // self.n_local_heads
-        k_full = k_cache.repeat_interleave(rep, dim=2)   # [B,Tmax,H,D]
-        v_full = v_cache.repeat_interleave(rep, dim=2)   # [B,Tmax,H,D]
-
-        # SDPA layout
-        q = q.transpose(1, 2)            # [B,H,S,D]
-        k_full = k_full.transpose(1, 2)  # [B,H,Tmax,D]
-        v_full = v_full.transpose(1, 2)  # [B,H,Tmax,D]
-
-        # ------------------------------------------------------------
-        # Prefill / chunked decode: dense attention (still cached hashes above)
-        # ------------------------------------------------------------
+        # ---- Dense prefill / chunked decode ----
         if seqlen != 1:
-            y = F.scaled_dot_product_attention(q, k_full, v_full, attn_mask=mask1, dropout_p=0.0)
+            # SDPA expects [B,H,S,D] and [B,H,T,D]
+            assert self.n_head % self.n_local_heads == 0
+            rep = self.n_head // self.n_local_heads
+
+            q_sdpa = q.transpose(1, 2)  # [B,H,S,D]
+
+            # Expand local-head cache to global heads for dense path only
+            if rep == 1:
+                k_full = k_cache
+                v_full = v_cache
+            else:
+                k_full = k_cache.repeat_interleave(rep, dim=2)
+                v_full = v_cache.repeat_interleave(rep, dim=2)
+
+            k_sdpa = k_full.transpose(1, 2)  # [B,H,Tmax,D]
+            v_sdpa = v_full.transpose(1, 2)  # [B,H,Tmax,D]
+
+            y = F.scaled_dot_product_attention(
+                q_sdpa, k_sdpa, v_sdpa,
+                attn_mask=mask1,
+                dropout_p=0.0,
+            )  # [B,H,S,D]
+
             y = y.transpose(1, 2).contiguous().view(bsz, seqlen, self.dim)
             return self.wo(y)
 
-        # ------------------------------------------------------------
-        # True decode (S==1)
-        # ------------------------------------------------------------
-        T = int(self.kv_cache.prefill_len.item())  # valid prefix length
+        # ---- True decode (S == 1): sparse backend with dummy last-128 indices ----
+        T = int(self.kv_cache.prefill_len.item())
+        assert T > 0
 
-        # allowed_ext from causal mask row
-        allowed_ext = mask1[..., :T].expand(bsz, self.n_head, 1, T)  # [B,H,1,T] bool
+        # Query: [B,H,D]
+        q_bhd = q.transpose(1, 2)[:, :, 0, :].contiguous()
 
-        # sink + local window (simple)
-        sink = int(getattr(self.config, "sink_size", 128)) if hasattr(self, "config") else 128
-        window = int(getattr(self.config, "window_size", 128)) if hasattr(self, "config") else 128
-        sink = max(0, min(sink, T))
-        window = max(0, min(window, T))
+        # Backend expects K/V as local-head layout [B,Hl,T,D]
+        k_backend = k_cache[:, :T].permute(0, 2, 1, 3).contiguous()  # [B,Hl,T,D]
+        v_backend = v_cache[:, :T].permute(0, 2, 1, 3).contiguous()  # [B,Hl,T,D]
 
-        prev_allowed = torch.zeros((bsz, self.n_head, 1, T), device=x.device, dtype=torch.bool)
-        if sink > 0:
-            prev_allowed[..., :sink] = True
-        if window > 0:
-            prev_allowed[..., T - window : T] = True
-        prev_allowed &= allowed_ext
+        # Dummy sparse list: last 128 tokens
+        Ktotal = min(128, T)
+        start = T - Ktotal
 
-        # budget M (absolute, from your config)
-        M = int(self.heavy_const)
-        M = max(0, min(M, T))
+        # Optional: reuse buffers to avoid per-token allocations
+        if getattr(self, "_dummy_sparse_buf", None) is None or self._dummy_sparse_buf.shape[-1] < Ktotal:
+            cap = max(Ktotal, 128)
+            self._dummy_idx_buf = torch.empty((cap,), device=x.device, dtype=torch.int32)
+            self._dummy_sparse_buf = torch.empty((1, self.n_head, cap), device=x.device, dtype=torch.int32)
+            self._dummy_len_buf = torch.empty((1, self.n_head), device=x.device, dtype=torch.int32)
 
-        if M == 0:
-            final_allowed = prev_allowed
-        else:
-            # ------------------------------------------------------------
-            # Soft hash query -> q_probs [B,H,L,R]
-            # ------------------------------------------------------------
-            q_bhd = q[:, :, 0, :]              # [B,H,D]
-            q_probs = self.soft_hash(q_bhd)    # [B,H,L,R]
+        idx = self._dummy_idx_buf[:Ktotal]
+        idx.copy_(torch.arange(start, T, device=x.device, dtype=torch.int32))
 
-            # ------------------------------------------------------------
-            # Get cached k_hard + v_norm for prefix, expand Hl -> H
-            # kv_cache.k_hard: [B,T,Hl,L] -> [B,T,H,L] -> [B,H,L,T]
-            # ------------------------------------------------------------
-            k_hard_pref = self.kv_cache.k_hard[:, :T]  # [B,T,Hl,L]
-            k_hard_pref = k_hard_pref.repeat_interleave(rep, dim=2)          # [B,T,H,L]
-            k_hard_pref = k_hard_pref.permute(0, 2, 3, 1).contiguous()       # [B,H,L,T]
+        sparse_list = self._dummy_sparse_buf[:, :, :Ktotal]
+        sparse_list.copy_(idx.view(1, 1, Ktotal).expand(1, self.n_head, Ktotal))
 
-            v_norm_pref = self.kv_cache.v_norm[:, :T]  # [B,T,Hl]
-            v_norm_pref = v_norm_pref.repeat_interleave(rep, dim=2)          # [B,T,H]
-            v_norm_pref = v_norm_pref.permute(0, 2, 1).contiguous()          # [B,H,T]
+        sparse_len = self._dummy_len_buf
+        sparse_len.fill_(Ktotal)
 
-            # ------------------------------------------------------------
-            # Vectorized expected collision:
-            # gathered = q_probs[..., bucket_id] for each (l,t)
-            #
-            # q_probs:     [B,H,L,R]
-            # buckets:     [B,H,L,T] -> make it [B,H,1,L,T] for gather along R
-            # gather out:  [B,H,1,L,T]
-            # sum over L:  [B,H,1,T]
-            # ------------------------------------------------------------
-            bkt = k_hard_pref.to(torch.long).unsqueeze(2)                     # [B,H,1,L,T]
-            gathered = torch.gather(q_probs.unsqueeze(2), dim=-1, index=bkt)  # [B,H,1,L,T]
-            collision = gathered.sum(dim=-2)                                  # [B,H,1,T]
+        out_bhd = sparse_attention_fwd(
+            q_bhd, k_backend, v_backend,
+            sparse_list, sparse_len,
+            block_seq=256,
+        )  # [B,H,D]
 
-            collision = collision.masked_fill(~allowed_ext, 0.0)
-
-            scores = collision.to(torch.float32) * v_norm_pref.unsqueeze(2).to(torch.float32)  # [B,H,1,T]
-            scores = scores.masked_fill(~allowed_ext, float("-inf"))
-
-            Km = min(M, T)
-            top_idx = torch.topk(scores, k=Km, dim=-1, largest=True).indices  # [B,H,1,Km]
-
-            bucket_allowed = torch.zeros((bsz, self.n_head, 1, T), device=x.device, dtype=torch.bool)
-            bucket_allowed.scatter_(dim=-1, index=top_idx, value=True)
-            bucket_allowed &= allowed_ext
-
-            final_allowed = (prev_allowed | bucket_allowed) & allowed_ext
-
-        # ------------------------------------------------------------
-        # SDPA with additive -inf mask over prefix length T
-        # ------------------------------------------------------------
-        additive = torch.zeros((bsz, self.n_head, 1, T), device=x.device, dtype=torch.float32)
-        additive = additive.masked_fill(~final_allowed, float("-inf")).to(q.dtype)
-
-        y = F.scaled_dot_product_attention(
-            q,
-            k_full[:, :, :T, :],
-            v_full[:, :, :T, :],
-            attn_mask=additive,
-            dropout_p=0.0,
-        )
-        y = y.transpose(1, 2).contiguous().view(bsz, 1, self.dim)
+        y = out_bhd.unsqueeze(2).transpose(1, 2).contiguous().view(bsz, 1, self.dim)
         return self.wo(y)
 
 
     def forward(self, x: Tensor, freqs_cis: Tensor, mask: Tensor, input_pos: Optional[Tensor] = None) -> Tensor:
+        print("DENSE")
         bsz, seqlen, _ = x.shape
 
         kv_size = self.n_local_heads * self.head_dim

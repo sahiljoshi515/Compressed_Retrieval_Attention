@@ -1,258 +1,432 @@
-import time
+import math
 import torch
-
 import triton
 import triton.language as tl
-import math
-import random
 
-# from .argsort import argsort
+# ---------------------------------------------------------
+# Kernel 2: score tokens in blocks and extract top-KC/block
+# Outputs candidates: cand_idx, cand_score
+# cand_idx:   [B, H, NB, KC] int32
+# cand_score: [B, H, NB, KC] fp32
+# ---------------------------------------------------------
+@triton.jit
+def block_candidates_kernel(
+    QPROBS,        # [B, H, L, R] fp16
+    K_HARD,        # [B, H, L, T] int16/int32 (bucket ids)
+    V_NORM,        # [B, H, T] fp16/bf16
+    ALLOWED,       # [B, H, T] bool
+    CAND_IDX,      # [B, H, NB, KC] int32
+    CAND_SCORE,    # [B, H, NB, KC] fp32
+    T: tl.constexpr,
+    stride_qpb, stride_qph, stride_qpl, stride_qpr,
+    stride_khb, stride_khh, stride_khl, stride_kht,
+    stride_vnb, stride_vnh, stride_vnt,
+    stride_ab, stride_ah, stride_at,
+    stride_cib, stride_cih, stride_cinb, stride_cik,
+    stride_csb, stride_csh, stride_csnb, stride_csk,
+    L: tl.constexpr,
+    R: tl.constexpr,
+    BLOCK_N: tl.constexpr,   # tokens per block (pow2 like 256/512)
+    KC: tl.constexpr,        # candidates per block (small, 8/16)
+):
+    b = tl.program_id(0)
+    h = tl.program_id(1)
+    nb = tl.program_id(2)
+
+    start = nb * BLOCK_N
+    offs = tl.arange(0, BLOCK_N)  # [BLOCK_N]
+    offs_t = start + offs
+    t_mask = offs_t < T
+
+    # allowed mask
+    allowed = tl.load(
+        ALLOWED + b * stride_ab + h * stride_ah + offs_t * stride_at,
+        mask=t_mask,
+        other=0,
+    ).to(tl.int1)
+
+    # v_norm
+    vnorm = tl.load(
+        V_NORM + b * stride_vnb + h * stride_vnh + offs_t * stride_vnt,
+        mask=t_mask,
+        other=0.0,
+    ).to(tl.float32)
+
+    # score[t] = vnorm[t] * sum_l q_probs[l, k_hard[l,t]]
+    score = tl.zeros([BLOCK_N], dtype=tl.float32)
+
+    for l_id in range(0, L):
+        bkt = tl.load(
+            K_HARD + b * stride_khb + h * stride_khh + l_id * stride_khl + offs_t * stride_kht,
+            mask=t_mask,
+            other=0,
+        ).to(tl.int32)
+
+        # guard invalid buckets (shouldn't happen, but safe)
+        bkt = tl.maximum(0, tl.minimum(bkt, R - 1))
+
+        probs_ptr = QPROBS + b * stride_qpb + h * stride_qph + l_id * stride_qpl + bkt * stride_qpr
+        p = tl.load(probs_ptr, mask=t_mask, other=0.0).to(tl.float32)
+        score += p
+
+    score *= vnorm
+    score = tl.where(t_mask & allowed, score, -float("inf"))
+
+    # NOTE: This iterative argmax is OK for KC<=8/16, but not great for KC>=32.
+    top_idx = tl.zeros([KC], dtype=tl.int32)
+    top_val = tl.zeros([KC], dtype=tl.float32)
+    work = score
+
+    ak = tl.arange(0, KC)
+
+    for ksel in range(0, KC):
+        m = tl.max(work, axis=0)  # scalar
+        is_max = work == m
+        candidate = tl.where(is_max, offs, 1 << 30)
+        arg = tl.min(candidate, axis=0).to(tl.int32)
+        abs_t = start + arg
+
+        top_idx = tl.where(ak == ksel, abs_t, top_idx)
+        top_val = tl.where(ak == ksel, m, top_val)
+        work = tl.where(offs == arg, -float("inf"), work)
+
+    # store
+    offs_k = tl.arange(0, KC)
+    ci_ptr = CAND_IDX + b * stride_cib + h * stride_cih + nb * stride_cinb + offs_k * stride_cik
+    cs_ptr = CAND_SCORE + b * stride_csb + h * stride_csh + nb * stride_csnb + offs_k * stride_csk
+    tl.store(ci_ptr, top_idx, mask=offs_k < KC)
+    tl.store(cs_ptr, top_val, mask=offs_k < KC)
+
+@torch.no_grad()
+def build_sparse_list_decode(
+    q_probs: torch.Tensor,         # [B,H,L,R] fp16
+    k_hard_bhlt: torch.Tensor,     # [B,H,L,T] int16/int32
+    v_norm_bht: torch.Tensor,      # [B,H,T] fp16/bf16
+    allowed_bht: torch.Tensor,     # [B,H,T] bool
+    sink: int,
+    window: int,
+    M: int,
+    KC: int = 8,
+    BLOCK_N: int = 512,
+    num_warps: int = 8,
+    num_stages: int = 2,
+):
+    assert q_probs.is_cuda and k_hard_bhlt.is_cuda and v_norm_bht.is_cuda and allowed_bht.is_cuda
+    assert q_probs.dtype in (torch.float16, torch.bfloat16)
+    assert allowed_bht.dtype == torch.bool
+
+    B, H, L, R = q_probs.shape
+    _, _, L2, T = k_hard_bhlt.shape
+    assert L2 == L
+
+    # 2) blockwise candidates
+    NB = (T + BLOCK_N - 1) // BLOCK_N
+    device = q_probs.device
+    cand_idx = torch.empty((B, H, NB, KC), device=device, dtype=torch.int32)
+    cand_score = torch.empty((B, H, NB, KC), device=device, dtype=torch.float32)
+
+    grid2 = (B, H, NB)
+
+    block_candidates_kernel[grid2](
+        q_probs,
+        k_hard_bhlt,
+        v_norm_bht,
+        allowed_bht,
+        cand_idx,
+        cand_score,
+        T=T,
+        stride_qpb=q_probs.stride(0), stride_qph=q_probs.stride(1), stride_qpl=q_probs.stride(2), stride_qpr=q_probs.stride(3),
+        stride_khb=k_hard_bhlt.stride(0), stride_khh=k_hard_bhlt.stride(1), stride_khl=k_hard_bhlt.stride(2), stride_kht=k_hard_bhlt.stride(3),
+        stride_vnb=v_norm_bht.stride(0), stride_vnh=v_norm_bht.stride(1), stride_vnt=v_norm_bht.stride(2),
+        stride_ab=allowed_bht.stride(0), stride_ah=allowed_bht.stride(1), stride_at=allowed_bht.stride(2),
+        stride_cib=cand_idx.stride(0), stride_cih=cand_idx.stride(1), stride_cinb=cand_idx.stride(2), stride_cik=cand_idx.stride(3),
+        stride_csb=cand_score.stride(0), stride_csh=cand_score.stride(1), stride_csnb=cand_score.stride(2), stride_csk=cand_score.stride(3),
+        L=L,
+        R=R,
+        BLOCK_N=BLOCK_N,
+        KC=KC,
+        num_warps=num_warps,
+        num_stages=num_stages,
+    )
+
+    # 3) global top-M from candidate pool (NB*KC << T)
+    cand_idx_flat = cand_idx.reshape(B, H, NB * KC)
+    cand_score_flat = cand_score.reshape(B, H, NB * KC)
+
+    M_eff = min(M, NB * KC)
+    if M_eff > 0:
+        top = torch.topk(cand_score_flat, k=M_eff, dim=-1, largest=True)
+        heavy_idx = torch.gather(cand_idx_flat, dim=-1, index=top.indices).to(torch.int32)
+    else:
+        heavy_idx = torch.empty((B, H, 0), device=device, dtype=torch.int32)
+
+    # heavy_idx: [B,H,M_eff]
+    valid = (heavy_idx >= 0) & (heavy_idx < T)
+    if valid.any():
+        ok = torch.gather(allowed_bht, dim=-1, index=heavy_idx.clamp(0, T-1).to(torch.long))
+        heavy_idx = heavy_idx.masked_fill(~(valid & ok), -1)
+    else:
+        heavy_idx = heavy_idx.fill_(-1)
+    # 4) sink + window base indices (structured)
+    sink = max(0, min(sink, T))
+    window = max(0, min(window, T))
+
+    parts = []
+    if sink > 0:
+        parts.append(torch.arange(sink, device=device, dtype=torch.int32))
+    if window > 0:
+        win_start = max(T - window, sink)
+        if win_start < T:
+            parts.append(torch.arange(win_start, T, device=device, dtype=torch.int32))
+
+    if len(parts) == 0:
+        base = torch.tensor([T - 1], device=device, dtype=torch.int32)
+    else:
+        base = torch.cat(parts, dim=0)
+
+    base = base.view(1, 1, -1).expand(B, H, -1)
+
+    # Filter base by allowed mask (keeps shape)
+    base_ok = torch.gather(allowed_bht, dim=-1, index=base.to(torch.long))
+    base = base.masked_fill(~base_ok, -1)
+
+    # 5) sparse_list / sparse_len
+    sparse_list = torch.cat([base, heavy_idx], dim=-1).contiguous()
+    sparse_len = torch.full((B, H), sparse_list.shape[-1], device=device, dtype=torch.int32)
+    return sparse_list, sparse_len
+
+
+
+# =========================================================
+# BACKEND (Stage 1+2): your flash-decode style sparse attention
+# =========================================================
+
+@triton.jit
+def _fwd_kernel_sparse_decode_stage1(
+    Q, K, V, sm_scale,
+    Sparse_List, Sparse_Len,
+    Mid_O, Mid_O_LogExpSum,
+    stride_sparse_b, stride_sparse_h,
+    stride_qbs, stride_qh, stride_qd,
+    stride_kbb, stride_kh, stride_ks,
+    stride_vbb, stride_vh, stride_vs,
+    stride_splen_b, stride_splen_h,
+    stride_mid_ob, stride_mid_oh, stride_mid_os, stride_mid_od,
+    stride_mid_o_eb, stride_mid_o_eh, stride_mid_o_es,
+    gqa_group_size: tl.constexpr,
+    BLOCK_SEQ: tl.constexpr,
+    BLOCK_DMODEL: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    cur_batch = tl.program_id(0)
+    cur_head = tl.program_id(1)
+    seq_start_block = tl.program_id(2)
+    cur_kv_head = cur_head // gqa_group_size
+
+    offs_d = tl.arange(0, BLOCK_DMODEL)
+
+    cur_seq_len_ptr = Sparse_Len + cur_batch * stride_splen_b + cur_head * stride_splen_h
+    cur_seq_len = tl.load(cur_seq_len_ptr)
+
+    cur_block_start = seq_start_block * BLOCK_SEQ
+    cur_block_end = tl.minimum(cur_seq_len, cur_block_start + BLOCK_SEQ)
+
+    sparse_ptr_base = Sparse_List + cur_batch * stride_sparse_b + cur_head * stride_sparse_h
+
+    off_q = cur_batch * stride_qbs + cur_head * stride_qh + offs_d
+    q = tl.load(Q + off_q)
+
+    sum_exp = 0.0
+    max_logic = -float("inf")
+    acc = tl.zeros([BLOCK_DMODEL], dtype=tl.float32)
+
+    block_n_size = (
+        tl.where(cur_block_end - cur_block_start <= 0, 0,
+                 cur_block_end - cur_block_start + BLOCK_N - 1) // BLOCK_N
+    )
+
+    offs_n = cur_block_start + tl.arange(0, BLOCK_N)
+
+    for start_n in range(0, block_n_size, 1):
+        offs_n_new = start_n * BLOCK_N + offs_n
+
+        token_idx = tl.load(
+            sparse_ptr_base + offs_n_new,
+            mask=offs_n_new < cur_seq_len,
+            other=0,
+        )
+
+        base_ptr = cur_batch * stride_kbb + cur_kv_head * stride_kh
+        off_k = base_ptr + token_idx[:, None] * stride_ks + offs_d[None, :]
+        k = tl.load(K + off_k, mask=offs_n_new[:, None] < cur_seq_len, other=0.0)
+        v = tl.load(V + off_k, mask=offs_n_new[:, None] < cur_seq_len, other=0.0)
+
+        att_value = tl.sum(q[None, :] * k, 1)
+        att_value *= sm_scale
+        att_value = tl.where(offs_n_new < cur_seq_len, att_value, float("-inf"))
+
+        cur_max_logic = tl.max(att_value, axis=0)
+        new_max_logic = tl.maximum(cur_max_logic, max_logic)
+
+        exp_logic = tl.exp(att_value - new_max_logic)
+        logic_scale = tl.exp(max_logic - new_max_logic)
+
+        acc *= logic_scale
+        acc += tl.sum(exp_logic[:, None] * v, axis=0)
+        sum_exp = sum_exp * logic_scale + tl.sum(exp_logic, axis=0)
+        max_logic = new_max_logic
+
+    need_store = tl.where(block_n_size == 0, 0, 1)
+    for _ in range(0, need_store, 1):
+        off_mid_o = (
+            cur_batch * stride_mid_ob
+            + cur_head * stride_mid_oh
+            + seq_start_block * stride_mid_os
+            + offs_d
+        )
+        off_mid_o_logexpsum = (
+            cur_batch * stride_mid_o_eb + cur_head * stride_mid_o_eh + seq_start_block
+        )
+        tl.store(Mid_O + off_mid_o, acc / sum_exp)
+        tl.store(Mid_O_LogExpSum + off_mid_o_logexpsum, max_logic + tl.log(sum_exp))
 
 
 @triton.jit
-def fwd_sparse_kernel(
-    Q, K, V, sm_scale, Heavy_List, Mask,
-    Out,
-    stride_qbs, stride_qh, stride_qd,
-    stride_kbs, stride_kh, stride_kd,
-    stride_vbs, stride_vh, stride_vd,
-    stride_heavy_list_bs, stride_heavy_list_h, stride_heavy_list_c,
-    stride_mbs, stride_mc,
-    out_stride_bs, out_stride_h, out_stride_d,
-
-    N_CTX,
-    HEAVY_CONST: tl.constexpr,
+def _fwd_kernel_sparse_decode_stage2(
+    Sparse_Len,
+    Mid_O,
+    Mid_O_LogExpSum,
+    O,
+    stride_splen_b, stride_splen_h,
+    stride_mid_ob, stride_mid_oh, stride_mid_os, stride_mid_od,
+    stride_mid_o_eb, stride_mid_o_eh, stride_mid_o_es,
+    stride_obs, stride_oh, stride_od,
+    BLOCK_SEQ: tl.constexpr,
     BLOCK_DMODEL: tl.constexpr,
-    BLOCK_HMODEL: tl.constexpr
 ):
     cur_batch = tl.program_id(0)
     cur_head = tl.program_id(1)
 
-    # [0:128]
     offs_d = tl.arange(0, BLOCK_DMODEL)
 
-    # q's offset -> [0:128]
-    off_q = cur_batch * stride_qbs + cur_head * stride_qh + offs_d * stride_qd
+    cur_seq_len_ptr = Sparse_Len + cur_batch * stride_splen_b + cur_head * stride_splen_h
+    cur_seq_len = tl.load(cur_seq_len_ptr)
 
-    # heavy list's offset -> [0:HEAVY_CONST]
-    offs_heavy = cur_batch * stride_heavy_list_bs + cur_head * stride_heavy_list_h + tl.arange(0, HEAVY_CONST) * stride_heavy_list_c
-    heavy_list = tl.load(Heavy_List + offs_heavy)
+    block_n_size = (tl.where(cur_seq_len <= 0, 0, cur_seq_len + BLOCK_SEQ - 1) // BLOCK_SEQ)
 
-    # kv's offset -> [0:HEAVY_CONST,0:128]
-    # batch -> heavy list -> head -> dmodel
-    off_kv = cur_batch * N_CTX * stride_kbs + heavy_list[:, None] * BLOCK_HMODEL * stride_kh + cur_head * stride_kh + offs_d[None, :] * stride_kd
+    sum_exp = 0.0
+    max_logic = -float("inf")
+    acc = tl.zeros([BLOCK_DMODEL], dtype=tl.float32)
 
-    off_mask = cur_batch * stride_mbs + tl.arange(0, HEAVY_CONST) * stride_mc
+    offs_v = cur_batch * stride_mid_ob + cur_head * stride_mid_oh + offs_d
+    offs_logic = cur_batch * stride_mid_o_eb + cur_head * stride_mid_o_eh
 
-    # load q k v
-    q = tl.load(Q + off_q)
-    k = tl.load(K + off_kv)
-    v = tl.load(V + off_kv)
+    for block_seq_n in range(0, block_n_size, 1):
+        tv = tl.load(Mid_O + offs_v + block_seq_n * stride_mid_os)
+        tlogic = tl.load(Mid_O_LogExpSum + offs_logic + block_seq_n)
 
-    # load mask
-    mask = tl.load(Mask + off_mask)
+        new_max_logic = tl.maximum(tlogic, max_logic)
+        old_scale = tl.exp(max_logic - new_max_logic)
+        acc *= old_scale
+        exp_logic = tl.exp(tlogic - new_max_logic)
+        acc += exp_logic * tv
+        sum_exp = sum_exp * old_scale + exp_logic
+        max_logic = new_max_logic
 
-    # compute att
-    att_value = tl.sum(q[None, :] * k, 1)
-    att_value *= sm_scale
-    att_value += mask
-    attn_weight = tl.softmax(att_value)
-    # attn_weight = tl.softmax(att_value.to(tl.float32)).to(tl.float16)
-    att_out = tl.sum(attn_weight[:, None] * v, 0)
-
-    # store to out
-    off_out = cur_batch * out_stride_bs + cur_head * out_stride_h + offs_d * out_stride_d
-    tl.store(Out + off_out, att_out)
+    off_o = cur_batch * stride_obs + cur_head * stride_oh + offs_d
+    tl.store(O + off_o, acc / sum_exp)
 
 
-def fwd_sparse(Q, K, V, Out, Heavy_List, Mask):
-
-    Lq, Lk = Q.shape[-1], K.shape[-1]
-
-    assert Lq == Lk
-    assert Lk in {16, 32, 64, 128}
-    sm_scale = 1.0 / (Lk ** 0.5)
-
-    B, H, D = Q.shape
-    HEAVY_CONST = Heavy_List.shape[-1]
-    N_CTX = K.shape[0] // B
-
-    # strides
-    stride_qbs, stride_qh, stride_qd = Q.stride()
-    stride_kbs, stride_kh, stride_kd = K.stride()
-    stride_vbs, stride_vh, stride_vd = V.stride()
-    stride_heavy_list_bs, stride_heavy_list_h, stride_heavy_list_c = Heavy_List.stride()
-    stride_mbs, stride_mc = Mask.stride()
-    out_stride_bs, out_stride_h, out_stride_d = Out.stride()
-
-    # grid
-    grid = (B, H)
-
-    fwd_sparse_kernel[grid](
-        Q, K, V, sm_scale, Heavy_List, Mask,
-        Out,
-        stride_qbs, stride_qh, stride_qd,
-        stride_kbs, stride_kh, stride_kd,
-        stride_vbs, stride_vh, stride_vd,
-        stride_heavy_list_bs, stride_heavy_list_h, stride_heavy_list_c,
-        stride_mbs, stride_mc,
-        out_stride_bs, out_stride_h, out_stride_d,
-        N_CTX, HEAVY_CONST, D, H
-    )
-
-    return Out
-
-
-@triton.jit
-def fwd_sparse_no_mask_kernel(
-    Q, K, V, sm_scale, Heavy_List,
-    Out,
-    stride_qbs, stride_qh, stride_qd,
-    stride_kbs, stride_kh, stride_kd,
-    stride_vbs, stride_vh, stride_vd,
-    stride_heavy_list_bs, stride_heavy_list_h, stride_heavy_list_c,
-    out_stride_bs, out_stride_h, out_stride_d,
-
-    N_CTX,
-    HEAVY_CONST: tl.constexpr,
-    BLOCK_DMODEL: tl.constexpr,
-    BLOCK_HMODEL: tl.constexpr
+@torch.no_grad()
+def sparse_decode_stage1(
+    q: torch.Tensor,            # [B,H,D]
+    k: torch.Tensor,            # [B,Kv,S,D]
+    v: torch.Tensor,            # [B,Kv,S,D]
+    sparse_list: torch.Tensor,  # [B,H,Ktotal]
+    sparse_len: torch.Tensor,   # [B,H]
+    max_len_in_batch: int,
+    mid_out: torch.Tensor,         # [B,H,block_seq_num,D] fp32
+    mid_out_logsumexp: torch.Tensor,# [B,H,block_seq_num] fp32
+    block_seq: int,
 ):
-    cur_batch = tl.program_id(0)
-    cur_head = tl.program_id(1)
+    BLOCK_N = 16
+    D = q.shape[-1]
+    assert D in {16, 32, 64, 128}
 
-    # [0:128]
-    offs_d = tl.arange(0, BLOCK_DMODEL)
+    sm_scale = 1.0 / math.sqrt(D)
+    B, H = q.shape[0], q.shape[1]
+    grid = (B, H, triton.cdiv(max_len_in_batch, block_seq))
+    gqa_group_size = H // k.shape[1]
 
-    # q's offset -> [0:128]
-    off_q = cur_batch * stride_qbs + cur_head * stride_qh + offs_d * stride_qd
-
-    # heavy list's offset -> [0:HEAVY_CONST]
-    offs_heavy = cur_batch * stride_heavy_list_bs + cur_head * stride_heavy_list_h + tl.arange(0, HEAVY_CONST) * stride_heavy_list_c
-    heavy_list = tl.load(Heavy_List + offs_heavy)
-
-    # kv's offset -> [0:HEAVY_CONST,0:128]
-    # batch -> heavy list -> head -> dmodel
-    off_kv = cur_batch * N_CTX * stride_kbs + heavy_list[:, None] * BLOCK_HMODEL * stride_kh + cur_head * stride_kh + offs_d[None, :] * stride_kd
-
-    # load q k v
-    q = tl.load(Q + off_q)
-    k = tl.load(K + off_kv)
-    v = tl.load(V + off_kv)
-
-    # compute att
-    att_value = tl.sum(q[None, :] * k, 1)
-    att_value *= sm_scale
-    attn_weight = tl.softmax(att_value)
-    att_out = tl.sum(attn_weight[:, None] * v, 0)
-
-    # store to out
-    off_out = cur_batch * out_stride_bs + cur_head * out_stride_h + offs_d * out_stride_d
-    tl.store(Out + off_out, att_out)
-
-
-def fwd_sparse_no_mask(Q, K, V, Out, Heavy_List):
-
-    Lq, Lk = Q.shape[-1], K.shape[-1]
-
-    assert Lq == Lk
-    assert Lk in {16, 32, 64, 128}
-    sm_scale = 1.0 / (Lk ** 0.5)
-
-    B, H, D = Q.shape
-    HEAVY_CONST = Heavy_List.shape[-1]
-    N_CTX = K.shape[0] // B
-
-    # strides
-    stride_qbs, stride_qh, stride_qd = Q.stride()
-    stride_kbs, stride_kh, stride_kd = K.stride()
-    stride_vbs, stride_vh, stride_vd = V.stride()
-    stride_heavy_list_bs, stride_heavy_list_h, stride_heavy_list_c = Heavy_List.stride()
-    out_stride_bs, out_stride_h, out_stride_d = Out.stride()
-
-    # grid
-    grid = (B, H)
-
-    fwd_sparse_no_mask_kernel[grid](
-        Q, K, V, sm_scale, Heavy_List,
-        Out,
-        stride_qbs, stride_qh, stride_qd,
-        stride_kbs, stride_kh, stride_kd,
-        stride_vbs, stride_vh, stride_vd,
-        stride_heavy_list_bs, stride_heavy_list_h, stride_heavy_list_c,
-        out_stride_bs, out_stride_h, out_stride_d,
-        N_CTX, HEAVY_CONST, D, H
+    _fwd_kernel_sparse_decode_stage1[grid](
+        q, k, v, sm_scale,
+        sparse_list, sparse_len,
+        mid_out, mid_out_logsumexp,
+        sparse_list.stride(0), sparse_list.stride(1),
+        q.stride(0), q.stride(1), q.stride(2),
+        k.stride(0), k.stride(1), k.stride(2),
+        v.stride(0), v.stride(1), v.stride(2),
+        sparse_len.stride(0), sparse_len.stride(1),
+        mid_out.stride(0), mid_out.stride(1), mid_out.stride(2), mid_out.stride(3),
+        mid_out_logsumexp.stride(0), mid_out_logsumexp.stride(1), mid_out_logsumexp.stride(2),
+        gqa_group_size,
+        BLOCK_SEQ=block_seq,
+        BLOCK_DMODEL=D,
+        BLOCK_N=BLOCK_N,
+        num_warps=4,
+        num_stages=2,
     )
 
-    return Out
+
+@torch.no_grad()
+def sparse_decode_stage2(
+    mid_out: torch.Tensor,
+    mid_out_logsumexp: torch.Tensor,
+    sparse_len: torch.Tensor,
+    out: torch.Tensor,       # [B,H,D] fp16/bf16
+    block_seq: int,
+):
+    D = out.shape[-1]
+    assert D in {16, 32, 64, 128}
+
+    B, H = out.shape[0], out.shape[1]
+    grid = (B, H)
+
+    _fwd_kernel_sparse_decode_stage2[grid](
+        sparse_len,
+        mid_out,
+        mid_out_logsumexp,
+        out,
+        sparse_len.stride(0), sparse_len.stride(1),
+        mid_out.stride(0), mid_out.stride(1), mid_out.stride(2), mid_out.stride(3),
+        mid_out_logsumexp.stride(0), mid_out_logsumexp.stride(1), mid_out_logsumexp.stride(2),
+        out.stride(0), out.stride(1), out.stride(2),
+        BLOCK_SEQ=block_seq,
+        BLOCK_DMODEL=D,
+        num_warps=4,
+        num_stages=2,
+    )
 
 
-def torch_fwd_sparse(Q, K, V, Heavy_List, Mask):
+@torch.no_grad()
+def sparse_attention_fwd(
+    query: torch.Tensor,      # [B,H,D]
+    key: torch.Tensor,        # [B,Kv,S,D]
+    value: torch.Tensor,      # [B,Kv,S,D]
+    sparse_list: torch.Tensor,# [B,H,Ktotal]
+    sparse_len: torch.Tensor, # [B,H]
+    block_seq: int = 256,
+) -> torch.Tensor:
+    assert query.is_cuda and key.is_cuda and value.is_cuda and sparse_list.is_cuda and sparse_len.is_cuda
+    B, H, D = query.shape
+    max_len_in_batch = int(sparse_len.max().item())
 
-    B, H, D = Q.shape
+    block_seq_num = (max_len_in_batch + block_seq - 1) // block_seq
+    mid_o = torch.empty((B, H, block_seq_num, D), dtype=torch.float32, device=query.device)
+    mid_o_log = torch.empty((B, H, block_seq_num), dtype=torch.float32, device=query.device)
+    out = torch.empty((B, H, D), dtype=query.dtype, device=query.device)
 
-    Out = torch.zeros(B, H, D, dtype=Q.dtype, device='cuda')
+    sparse_decode_stage1(query, key, value, sparse_list, sparse_len, max_len_in_batch, mid_o, mid_o_log, block_seq)
+    sparse_decode_stage2(mid_o, mid_o_log, sparse_len, out, block_seq)
+    return out
 
-    K = K.view(B, -1, H, D)
-    V = V.view(B, -1, H, D)
-
-    for b in range(B):
-        for h in range(H):
-            q = Q[b, h]
-            heavy_list = Heavy_List[b, h]
-            k = K[b, heavy_list, h]
-            v = V[b, heavy_list, h]
-
-            att_value = torch.sum(q[None, :] * k, 1)
-            att_value *= 1.0 / (D ** 0.5)
-            att_value += Mask[b]
-            attn_weight = torch.softmax(att_value.to(torch.float32), 0).to(torch.float16)
-            att_out = torch.sum(attn_weight[:, None] * v, 0)
-
-            Out[b, h] = att_out
-
-    return Out
-
-
-def test_fwd_sparse():
-
-    B, N_CTX, H, D = 32, 2048, 32, 128
-    HEAVY_CONST = 128
-
-    dtype = torch.float16
-
-    Q = torch.randn(B, H, D, dtype=dtype, device='cuda').normal_(mean=0.1, std=0.2)
-    K = torch.randn(B * N_CTX, H, D, dtype=dtype, device='cuda').normal_(mean=0.1, std=0.2)
-    V = torch.randn(B * N_CTX, H, D, dtype=dtype, device='cuda').normal_(mean=0.1, std=0.2)
-
-    Heavy_List = torch.zeros(B, H, HEAVY_CONST, dtype=torch.int64, device='cuda')
-    Mask = torch.zeros(B, HEAVY_CONST, dtype=dtype, device='cuda')
-
-    for b in range(B):
-        for h in range(H):
-            Heavy_List[b,h] = torch.randperm(N_CTX, device='cuda')[:HEAVY_CONST]
-
-    Out = torch.zeros(B, H, D, dtype=dtype, device='cuda')
-
-    # Warm up
-    fwd_sparse(Q, K, V, Out, Heavy_List, Mask)
-
-    run_iter = 1000
-    torch.cuda.synchronize()
-    t1 = time.time()
-    for _ in range(run_iter):
-        fwd_sparse(Q, K, V, Out, Heavy_List, Mask)
-    torch.cuda.synchronize()
-    t2 = time.time()
-    print(f"Time cost {(t2 - t1) / run_iter}")
-
-
-    torch_out = torch_fwd_sparse(Q, K, V, Heavy_List, Mask)
-
-    print("max ", torch.max(torch.abs(torch_out - Out)))
-    print("mean ", torch.mean(torch.abs(torch_out - Out)))
-    assert torch.allclose(torch_out, Out, atol=1e-3, rtol=0)
-
-
-if __name__ == '__main__':
-    test_fwd_sparse()
