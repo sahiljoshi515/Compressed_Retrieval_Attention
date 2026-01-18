@@ -165,6 +165,7 @@ def generate(
     interactive: bool,
     draft_model: Transformer,
     speculate_k: Optional[int] = 8,
+    decode_type: str = "dense",
     callback = lambda x: x,
     **sampling_kwargs
 ) -> torch.Tensor:
@@ -173,6 +174,9 @@ def generate(
     """
 
     is_speculative = draft_model is not None
+    if is_speculative and decode_type != "dense":
+        print("Warning: sparse decode is not supported for speculative decoding; using dense.")
+        decode_type = "dense"
     # create an empty tensor of the expected final shape and fill in the current tokens
     T = prompt.size(1)
     batch_size = prompt.size(0)
@@ -247,7 +251,15 @@ def generate(
             input_pos = input_pos + num_added
             next_token = next_tokens[-1]
     else:
-        generated_tokens, _ = decode_n_tokens(model, next_token, input_pos, max_new_tokens - 1, callback=callback, decode_type="dense", **sampling_kwargs)
+        generated_tokens, _ = decode_n_tokens(
+            model,
+            next_token,
+            input_pos,
+            max_new_tokens - 1,
+            callback=callback,
+            decode_type=decode_type,
+            **sampling_kwargs,
+        )
         seq[:,T + 1:] = torch.cat(generated_tokens, dim=1)
 
     if use_cuda_timing:
@@ -348,6 +360,7 @@ def main(
     profile: Optional[Path] = None,
     draft_checkpoint_path: Optional[Path] = None,
     speculate_k: int = 5,
+    decode_type: str = "dense",
     batch_size: int = 1,
 ) -> None:
     """Generates text samples based on a pre-trained Transformer model and tokenizer.
@@ -400,8 +413,9 @@ def main(
             global model_forward, logits_to_prob
             model_forward = torch.compile(model_forward, mode="reduce-overhead", fullgraph=True)
 
-        global decode_one_token, prefill
+        global decode_one_token, prefill, sparse_decode_one_token
         decode_one_token = torch.compile(decode_one_token, mode="reduce-overhead", fullgraph=True)
+        sparse_decode_one_token = torch.compile(sparse_decode_one_token, mode = "reduce-overhead", fullgraph=True)
         # decode_one_token = torch.compile(decode_one_token, fullgraph=True)
 
         # Uncomment to squeeze more perf out of prefill
@@ -456,6 +470,7 @@ def main(
                 speculate_k=speculate_k,
                 interactive=interactive,
                 callback=callback,
+                decode_type=decode_type,
                 temperature=temperature,
                 top_k=top_k,
             )
@@ -504,7 +519,7 @@ if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser(description='Your CLI description.')
 
-    parser.add_argument('--prompt', type=str, default="Hello, my name is", help='Input prompt.')
+    parser.add_argument('--prompt', type=str, default="Write me a 1000 word story on soccer.", help='Input prompt.')
     parser.add_argument('--prompt_file', type=Path, default=None, help='Path to a text file containing the prompt (avoids argument length limits).')
     parser.add_argument('--interactive', action='store_true', help='Whether to launch in interactive mode')
     parser.add_argument('--num_samples', type=int, default=1, help='Number of samples.')
@@ -518,6 +533,7 @@ if __name__ == '__main__':
     parser.add_argument('--speculate_k', type=int, default=5, help='Speculative execution depth.')
     parser.add_argument('--draft_checkpoint_path', type=Path, default=None, help='Draft checkpoint path.')
     parser.add_argument('--batch_size', type=int, default=1, help='Batch Size')
+    parser.add_argument('--decode_type', type=str, default="dense", choices=["dense", "sparse"], help='Decode path to use for generation.')
 
     args = parser.parse_args()
     main(
@@ -534,5 +550,6 @@ if __name__ == '__main__':
         profile=args.profile,
         draft_checkpoint_path=args.draft_checkpoint_path,
         speculate_k=args.speculate_k,
+        decode_type=args.decode_type,
         batch_size=args.batch_size,
     )
