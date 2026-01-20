@@ -7,12 +7,13 @@ import torch.nn as nn
 from torch.nn import functional as F
 from torch import Tensor
 import os, sys
+import time
 # Keep this repo root on sys.path so local kernels import cleanly.
 REPO_ROOT = os.path.abspath(os.path.dirname(__file__))
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
     
-from kernels.sparse import decode_sparse_attention
+from kernels.sparse import rw_decode_sparse_attention
 from kernels.soft_hash_score import soft_hash_score_ext
 
 def find_multiple(n: int, k: int) -> int:
@@ -471,6 +472,7 @@ class Attention(nn.Module):
         # Prefix K/V token payload for kernel: [B,H,T,D]
         k_tok = self.kv_cache.k_cache[:, :T]         # [B,T,Hl,D]
         v_tok = self.kv_cache.v_cache[:, :T]         # [B,T,Hl,D]
+
         k_full = gqa_repeat_kv(k_tok, rep).permute(0, 2, 1, 3).contiguous()  # [B,H,T,D]
         v_full = gqa_repeat_kv(v_tok, rep).permute(0, 2, 1, 3).contiguous()  # [B,H,T,D]
 
@@ -520,11 +522,11 @@ class Attention(nn.Module):
         seqlens_b = torch.full((B,), T, device=x.device, dtype=torch.int32)
 
         # Run Triton sparse decode
-        out_bh1d = decode_sparse_attention(
-            q_bh1d=q_bh1d.to(self.config.cache_dtype),
-            k_bhtd=k_full.to(self.config.cache_dtype),
-            v_bhtd=v_full.to(self.config.cache_dtype),
-            seqlens_b=seqlens_b,
+        out_bh1d = rw_decode_sparse_attention(
+            q=q_bh1d.to(self.config.cache_dtype),
+            k=k_full.to(self.config.cache_dtype),
+            v=v_full.to(self.config.cache_dtype),
+            seqlens=seqlens_b,
             block_index=block_index,
             block_n=self.config.sparse_block_size,
         )  # [B,H,1,D]

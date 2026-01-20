@@ -292,7 +292,7 @@ def sparse_attention_fwd(
 
 
 @triton.jit
-def decode_kernel(
+def rw_decode_fwd(
     Q, K, V, seqlens, block_index, Out,
     stride_qz, stride_qh, stride_qt, stride_qd,
     stride_kz, stride_kh, stride_kt, stride_kd,
@@ -305,66 +305,73 @@ def decode_kernel(
     BLOCK_D: tl.constexpr,
     dtype: tl.constexpr,
 ):
+    # program per (b,h)
     pid = tl.program_id(0)
     b = pid // H
     h = pid % H
 
-    seqlen = tl.load(seqlens + b).to(tl.int32)
+    seqlen = tl.load(seqlens + b)  # int32
+    # last token index in absolute KV positions
     q_pos = seqlen - 1
 
+    # offsets
     offs_d = tl.arange(0, BLOCK_D)
     offs_n = tl.arange(0, BLOCK_N)
 
+    # base pointers
     q_off = b * stride_qz + h * stride_qh
     k_off = b * stride_kz + h * stride_kh
     v_off = b * stride_vz + h * stride_vh
     o_off = b * stride_oz + h * stride_oh
 
+    # Q points at time dimension (T_q==1). We load index 0.
     q_ptrs = Q + q_off + 0 * stride_qt + offs_d * stride_qd
     q = tl.load(q_ptrs, mask=offs_d < BLOCK_D, other=0.0).to(tl.float32)
 
-    qk_scale = sm_scale * 1.44269504  # * log2(e)
+    # scale into log2 space for exp2
+    qk_scale = sm_scale * 1.44269504
     q = (q * qk_scale).to(tl.float32)
 
-    m_i = tl.full([], -float("inf"), tl.float32)
-    l_i = tl.zeros([], tl.float32)
-    acc = tl.zeros([BLOCK_D], tl.float32)
+    # output accumulator
+    m_i = tl.full([], -float("inf"), tl.float32)    # scalar
+    l_i = tl.zeros([], tl.float32)                  # scalar
+    acc = tl.zeros([BLOCK_D], tl.float32)           # vector
 
+    # block list pointer: (B,H,KLIST)
     blk_ptr = block_index + (b * H + h) * KLIST
 
-    for j in tl.static_range(0, KLIST):
+    # loop over chosen blocks
+    for j in range(0, KLIST):
         blk = tl.load(blk_ptr + j).to(tl.int32)
         do_blk = blk >= 0
-
-        start_t = blk * BLOCK_N
+        blk_safe = tl.maximum(blk, 0)     # <--- add this
+        start_t = blk_safe * BLOCK_N      # <--- use blk_safe
         cols = start_t + offs_n
 
         kv_mask = (cols < seqlen) & do_blk
 
+
+        # load K block: shape (BLOCK_N, D)
         k_ptrs = K + k_off + cols[:, None] * stride_kt + offs_d[None, :] * stride_kd
-        k = tl.load(
-            k_ptrs,
-            mask=kv_mask[:, None] & (offs_d[None, :] < BLOCK_D),
-            other=0.0
-        ).to(tl.float32)
+        k = tl.load(k_ptrs, mask=kv_mask[:, None] & (offs_d[None, :] < BLOCK_D), other=0.0).to(tl.float32)
 
-        qk = tl.sum(k * q[None, :], axis=1)
+        # logits: (BLOCK_N,)
+        qk = tl.sum(k * q[None, :], axis=1)  # fp32
 
+        # causal for decode: cols <= q_pos
         causal = cols <= q_pos
         qk = tl.where(kv_mask & causal, qk, -float("inf"))
 
+        # online softmax update (scalar m_i/l_i, vector acc)
         block_max = tl.max(qk, axis=0)
         m_new = tl.maximum(m_i, block_max)
 
         alpha = tl.math.exp2(m_i - m_new)
         p = tl.math.exp2(qk - m_new)
 
+        # load V block: shape (BLOCK_N, D)
         v_ptrs = V + v_off + cols[:, None] * stride_vt + offs_d[None, :] * stride_vd
-        v = tl.load(
-            v_ptrs,
-            mask=kv_mask[:, None] & (offs_d[None, :] < BLOCK_D),
-            other=0.0
-        ).to(tl.float32)
+        v = tl.load(v_ptrs, mask=kv_mask[:, None] & (offs_d[None, :] < BLOCK_D), other=0.0).to(tl.float32)
 
         acc = acc * alpha + tl.sum(v * p[:, None], axis=0)
         l_i = l_i * alpha + tl.sum(p, axis=0)
@@ -375,53 +382,50 @@ def decode_kernel(
     o_ptrs = Out + o_off + offs_d * stride_od
     tl.store(o_ptrs, acc.to(dtype), mask=offs_d < BLOCK_D)
 
-def decode_sparse_attention(
-    q_bh1d: torch.Tensor,       # (B,H,1,D)
-    k_bhtd: torch.Tensor,       # (B,H,T,D)
-    v_bhtd: torch.Tensor,       # (B,H,T,D)
-    seqlens_b: torch.Tensor,    # (B,) int32
-    block_index: torch.Tensor,  # (B,H,KLIST) int32
-    block_n: int,
-) -> torch.Tensor:
-    """
-    Returns: (B,H,1,D)
-    """
 
-    assert q_bh1d.is_cuda and k_bhtd.is_cuda and v_bhtd.is_cuda
-    assert q_bh1d.dtype in (torch.float16, torch.bfloat16)
-    assert q_bh1d.shape[0] == k_bhtd.shape[0] == v_bhtd.shape[0]
-    assert q_bh1d.shape[1] == k_bhtd.shape[1] == v_bhtd.shape[1]
-    B, H, Tq, D = q_bh1d.shape
+def rw_decode_sparse_attention(
+    q: torch.Tensor,          # (B,H,1,D)
+    k: torch.Tensor,          # (B,H,T_k,D)
+    v: torch.Tensor,          # (B,H,T_k,D)
+    seqlens: torch.Tensor,    # (B,) int32
+    block_index: torch.Tensor,# (B,H,KLIST) int32
+    block_n: int = 64,
+) -> torch.Tensor:
+    assert q.is_cuda and k.is_cuda and v.is_cuda
+    assert q.dtype in (torch.float16, torch.bfloat16)
+    assert q.shape[0] == k.shape[0] == v.shape[0]
+    assert q.shape[1] == k.shape[1] == v.shape[1]
+    B, H, Tq, D = q.shape
     assert Tq == 1
     assert D in (16, 32, 64, 128)
     assert block_index.dtype == torch.int32
+    KLIST = block_index.shape[-1]
 
-    q_bh1d = q_bh1d.contiguous()
-    k_bhtd = k_bhtd.contiguous()
-    v_bhtd = v_bhtd.contiguous()
+    q = q.contiguous()
+    k = k.contiguous()
+    v = v.contiguous()
     block_index = block_index.contiguous()
-    seqlens_b = seqlens_b.contiguous()
 
-    out_bhd = torch.empty((B, H, D), device=q_bh1d.device, dtype=q_bh1d.dtype)
+    out = torch.empty((B, H, D), device=q.device, dtype=q.dtype)
 
     grid = (B * H,)
-    dtype = tl.bfloat16 if q_bh1d.dtype == torch.bfloat16 else tl.float16
+
+    dtype = tl.bfloat16 if q.dtype == torch.bfloat16 else tl.float16
     sm_scale = (D ** -0.5)
 
-    # Strides are in elements, Triton expects that
-    decode_kernel[grid](
-        q_bh1d, k_bhtd, v_bhtd, seqlens_b, block_index, out_bhd,
-        q_bh1d.stride(0), q_bh1d.stride(1), q_bh1d.stride(2), q_bh1d.stride(3),
-        k_bhtd.stride(0), k_bhtd.stride(1), k_bhtd.stride(2), k_bhtd.stride(3),
-        v_bhtd.stride(0), v_bhtd.stride(1), v_bhtd.stride(2), v_bhtd.stride(3),
-        out_bhd.stride(0), out_bhd.stride(1), out_bhd.stride(2),
+    rw_decode_fwd[grid](
+        q, k, v, seqlens, block_index, out,
+        q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+        k.stride(0), k.stride(1), k.stride(2), k.stride(3),
+        v.stride(0), v.stride(1), v.stride(2), v.stride(3),
+        out.stride(0), out.stride(1), out.stride(2),
         H=H,
-        KLIST=block_index.shape[-1],
+        KLIST=KLIST,
         sm_scale=sm_scale,
         BLOCK_N=block_n,
         BLOCK_D=D,
         dtype=dtype,
-        num_warps=1,
-        num_stages=1,
+        num_warps=4,
+        num_stages=2,
     )
-    return out_bhd.unsqueeze(2)  # (B,H,1,D)
+    return out.unsqueeze(2)  # (B,H,1,D)
