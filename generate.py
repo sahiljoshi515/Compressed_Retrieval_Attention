@@ -211,7 +211,7 @@ def generate(
     else:
         prefill_start_t = time.perf_counter()
 
-    next_token = prefill(model, prompt, input_pos, "dense", **sampling_kwargs)
+    next_token = prefill(model, prompt, input_pos, "sparse", **sampling_kwargs)
     # model.build_tables(prefill_len=prompt.size(1))
 
     if is_speculative:
@@ -247,7 +247,7 @@ def generate(
             input_pos = input_pos + num_added
             next_token = next_tokens[-1]
     else:
-        generated_tokens, _ = decode_n_tokens(model, next_token, input_pos, max_new_tokens - 1, callback=callback, decode_type="dense", **sampling_kwargs)
+        generated_tokens, _ = decode_n_tokens(model, next_token, input_pos, max_new_tokens - 1, callback=callback, decode_type="sparse", **sampling_kwargs)
         seq[:,T + 1:] = torch.cat(generated_tokens, dim=1)
 
     if use_cuda_timing:
@@ -508,7 +508,7 @@ if __name__ == '__main__':
     parser.add_argument('--prompt_file', type=Path, default=None, help='Path to a text file containing the prompt (avoids argument length limits).')
     parser.add_argument('--interactive', action='store_true', help='Whether to launch in interactive mode')
     parser.add_argument('--num_samples', type=int, default=1, help='Number of samples.')
-    parser.add_argument('--max_new_tokens', type=int, default=10000, help='Maximum number of new tokens.')
+    parser.add_argument('--max_new_tokens', type=int, default=10, help='Maximum number of new tokens.')
     parser.add_argument('--top_k', type=int, default=200, help='Top-k for sampling.')
     parser.add_argument('--temperature', type=float, default=0.8, help='Temperature for sampling.')
     parser.add_argument('--checkpoint_path', type=Path, default=Path("/scratch/sj157/Compressed_Retrieval_Attention/checkpoints/meta-llama/Llama-2-7b-chat-hf/model.pth"), help='Model checkpoint path.')
