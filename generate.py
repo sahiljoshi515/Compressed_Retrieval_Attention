@@ -23,6 +23,92 @@ sys.path.append(str(wd))
 from model import Transformer
 from tp import maybe_init_dist
 from sentencepiece import SentencePieceProcessor
+from kernels.sparse import build_sparse_list_decode, sparse_attention_fwd
+
+@torch.no_grad()
+def warmup_triton_sparse_decode(model: Transformer, device: torch.device, *, T: int = 4096, block_seq: int = 256):
+    """
+    Warm up BOTH:
+      - build_sparse_list_decode (index_build)
+      - sparse_attention_fwd (sparse_kernel)
+
+    Call after model.setup_caches(...) and model is on `device`.
+    """
+    attn = model.layers[0].attention
+    B = 1
+    H = attn.n_head
+    Hl = attn.n_local_heads
+    D = attn.head_dim
+    L = attn.L
+    R = attn.R
+    Ktotal = int(attn.heavy_const)
+
+    # representative decode length (prefix length)
+    T = int(T)
+    T = max(T, 256)  # avoid tiny degenerate shapes
+
+    # Build dummy inputs on device
+    q_bhd = torch.empty((B, H, D), device=device, dtype=torch.bfloat16)
+
+    # q_probs: [B,H,L,R]
+    q_probs = torch.empty((B, H, L, R), device=device, dtype=torch.bfloat16).normal_()
+
+    # k_hard_bhlt: [B,H,L,T] int16 in [0, R-1]
+    k_hard_bhlt = torch.randint(
+        low=0, high=R, size=(B, H, L, T), device=device, dtype=torch.int16
+    )
+
+    # v_norm_bht: [B,H,T] fp16
+    v_norm_bht = torch.rand((B, H, T), device=device, dtype=torch.float16)
+
+    # allowed_bht: [B,H,T] bool
+    allowed_bht = torch.ones((B, H, T), device=device, dtype=torch.bool)
+
+    # k/v backend: [B,Hl,T,D] bf16
+    k_backend = torch.empty((B, Hl, T, D), device=device, dtype=torch.bfloat16)
+    v_backend = torch.empty((B, Hl, T, D), device=device, dtype=torch.bfloat16)
+
+    # Use same knobs as your decode
+    sink = int(getattr(attn.config, "sink_size", 20))
+    window = int(getattr(attn.config, "window_size", 20))
+    M = int(attn.heavy_const)
+
+    sink = max(0, min(sink, T))
+    window = max(0, min(window, T))
+    M = max(0, min(M, T))
+
+    # Run twice to ensure compilation + any autotune paths complete
+    for _ in range(2):
+        sparse_list, sparse_len = build_sparse_list_decode(
+            q_probs,
+            k_hard_bhlt,
+            v_norm_bht,
+            allowed_bht,
+            sink=sink,
+            window=window,
+            M=M,
+            KC=8,
+            BLOCK_N=512,
+            num_warps=8,
+            num_stages=2,
+        )
+
+        if sparse_list.dtype != torch.int32:
+            sparse_list = sparse_list.to(torch.int32)
+        if sparse_len.dtype != torch.int32:
+            sparse_len = sparse_len.to(torch.int32)
+
+        _ = sparse_attention_fwd(
+            q_bhd,
+            k_backend,
+            v_backend,
+            sparse_list,
+            sparse_len,
+            block_seq=block_seq,
+        )
+
+    torch.cuda.synchronize()
+
 
 def multinomial_sample_one_no_sync(probs_sort): # Does multinomial sampling without a cuda synchronization
     q = torch.empty_like(probs_sort).exponential_(1)
@@ -193,6 +279,9 @@ def generate(
         if is_speculative and draft_model is not model:
             draft_model.setup_caches(max_batch_size=batch_size, max_seq_length=max_seq_length)
 
+    T_warm = min(model.max_seq_length, prompt.size(1)) 
+    print("T_warm:", T_warm)
+    warmup_triton_sparse_decode(model, torch.device("cuda"), T=T_warm, block_seq=256)
     # create an empty tensor of the expected final shape and fill in the current tokens
     empty = torch.empty((batch_size, T_new), dtype=dtype, device=device)
     empty[:,:T] = prompt
@@ -215,7 +304,7 @@ def generate(
     else:
         prefill_start_t = time.perf_counter()
 
-    next_token = prefill(model, prompt, input_pos, "dense", **sampling_kwargs)
+    next_token = prefill(model, prompt, input_pos, decode_type, **sampling_kwargs)
     # model.build_tables(prefill_len=prompt.size(1))
 
     if is_speculative:
@@ -413,9 +502,8 @@ def main(
             global model_forward, logits_to_prob
             model_forward = torch.compile(model_forward, mode="reduce-overhead", fullgraph=True)
 
-        global decode_one_token, prefill, sparse_decode_one_token
+        global decode_one_token, prefill
         decode_one_token = torch.compile(decode_one_token, mode="reduce-overhead", fullgraph=True)
-        sparse_decode_one_token = torch.compile(sparse_decode_one_token, mode = "reduce-overhead", fullgraph=True)
         # decode_one_token = torch.compile(decode_one_token, fullgraph=True)
 
         # Uncomment to squeeze more perf out of prefill
@@ -523,7 +611,7 @@ if __name__ == '__main__':
     parser.add_argument('--prompt_file', type=Path, default=None, help='Path to a text file containing the prompt (avoids argument length limits).')
     parser.add_argument('--interactive', action='store_true', help='Whether to launch in interactive mode')
     parser.add_argument('--num_samples', type=int, default=1, help='Number of samples.')
-    parser.add_argument('--max_new_tokens', type=int, default=10000, help='Maximum number of new tokens.')
+    parser.add_argument('--max_new_tokens', type=int, default=50, help='Maximum number of new tokens.')
     parser.add_argument('--top_k', type=int, default=200, help='Top-k for sampling.')
     parser.add_argument('--temperature', type=float, default=0.8, help='Temperature for sampling.')
     parser.add_argument('--checkpoint_path', type=Path, default=Path("/scratch/sj157/Compressed_Retrieval_Attention/checkpoints/meta-llama/Llama-2-7b-chat-hf/model.pth"), help='Model checkpoint path.')
