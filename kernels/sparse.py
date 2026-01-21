@@ -360,7 +360,7 @@ def rw_decode_fwd(
 
         # causal for decode: cols <= q_pos
         causal = cols <= q_pos
-        qk = tl.where(kv_mask & causal, qk, -float("inf"))
+        qk = tl.where(kv_mask, qk, -float("inf"))
 
         # online softmax update (scalar m_i/l_i, vector acc)
         block_max = tl.max(qk, axis=0)

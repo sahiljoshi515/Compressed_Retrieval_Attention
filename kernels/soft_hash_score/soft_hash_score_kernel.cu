@@ -70,8 +70,8 @@ torch::Tensor soft_hash_score_cuda(
 
     // Dispatch on compile-time L for unrolling.
     switch (L) {
-        case 40:
-            soft_hash_collision_kernel_vnorm<40><<<grid, block>>>(
+        case 4:
+            soft_hash_collision_kernel_vnorm<4><<<grid, block>>>(
                 q_ptr, k_ptr, v_ptr, a_ptr, o_ptr, B, H, R, T);
             break;
         case 32:

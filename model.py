@@ -7,25 +7,56 @@ import torch.nn as nn
 from torch.nn import functional as F
 from torch import Tensor
 import os, sys
-from torch.nn.attention.flex_attention import (
-    _mask_mod_signature,
-    BlockMask,
-    flex_attention,
-)
 
 # Keep this repo root on sys.path so local kernels import cleanly.
 REPO_ROOT = os.path.abspath(os.path.dirname(__file__))
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
+from torch.nn.attention.flex_attention import (
+    _mask_mod_signature,
+    BlockMask,
+    flex_attention,
+)
+
 from kernels.sparse import rw_decode_sparse_attention
 from kernels.soft_hash_score import soft_hash_score_ext
+# from kernels.decode_sparse import rw_decode_ext
 
 
 def find_multiple(n: int, k: int) -> int:
     if n % k == 0:
         return n
     return n + k - (n % k)
+
+
+class CUDATimer:
+    """Lightweight CUDA-event timer."""
+    __slots__ = ("enabled", "start", "end")
+
+    def __init__(self, enabled: bool):
+        self.enabled = enabled
+        if enabled:
+            self.start = torch.cuda.Event(enable_timing=True)
+            self.end = torch.cuda.Event(enable_timing=True)
+        else:
+            self.start = None
+            self.end = None
+
+    def __enter__(self):
+        if self.enabled:
+            self.start.record()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if self.enabled:
+            self.end.record()
+
+    def ms(self) -> float:
+        if not self.enabled:
+            return 0.0
+        # caller should synchronize at a boundary, not every timer
+        return self.start.elapsed_time(self.end)
 
 
 @dataclass
@@ -43,15 +74,15 @@ class ModelArgs:
     norm_eps: float = 1e-5
 
     # hashing / routing
-    L: int = 40
-    R: int = 1024
-    K: int = 10
+    L: int = 64
+    R: int = 4
+    K: int = 2
     sparse_block_size: int = 8
-    heavy_const: int = 1160   # token budget
+    heavy_const: int = 600   # token budget
     max_batch_size: int = 1
     cache_dtype: torch.dtype = torch.bfloat16
-    sink_size: int = 60
-    window_size: int = 60
+    sink_size: int = 30
+    window_size: int = 30
 
     def __post_init__(self):
         if self.n_local_heads == -1:
@@ -223,23 +254,6 @@ class KVCache(nn.Module):
 
         self.register_buffer("prefill_len", torch.zeros((), dtype=torch.int32))
 
-
-    # def update(self, input_pos, k_val, v_val):
-    #     """
-    #     input_pos: [S]
-    #     k_val: [B, S, H, D]
-    #     v_val: [B, S, H, D]
-    #     """
-    #     assert input_pos.shape[0] == k_val.shape[1]
-    #     self.k_cache[:, input_pos] = k_val
-    #     self.v_cache[:, input_pos] = v_val
-
-    #     # track length (assumes monotonic positions)
-    #     # works for both prefill (S>1) and decode (S=1)
-    #     max_pos = int(input_pos.max().item()) + 1
-    #     self.prefill_len.fill_(max(self.prefill_len.item(), max_pos))
-
-    #     return self.k_cache, self.v_cache
     @torch.no_grad()
     def update(
         self,
@@ -344,6 +358,67 @@ class KVCache(nn.Module):
 # Model blocks
 # ============================================================
 
+@torch.no_grad()
+def flashinfer_sparse_decode(q_bh1d, k_bhtd, v_bhtd, block_index_bhk, seqlens_b, block_n: int):
+    """
+    q_bh1d: [B,H,1,D]
+    k_bhtd: [B,H,T,D]
+    v_bhtd: [B,H,T,D]
+    block_index_bhk: [B,H,KLIST] int32 block ids
+    seqlens_b: [B] int32
+    block_n: tokens per block (bs)
+    Returns: [B,H,1,D]
+    """
+    assert q_bh1d.ndim == 4 and q_bh1d.size(2) == 1
+    B, H, _, D = q_bh1d.shape
+    device = q_bh1d.device
+    bs = block_n
+
+    # Build token indices from block ids: token = blk*bs + offset
+    offsets = torch.arange(bs, device=device, dtype=torch.int32)  # [bs]
+    tok = block_index_bhk[..., None] * bs + offsets[None, None, None, :]  # [B,H,KLIST,bs]
+    tok = tok.reshape(B, H, -1)  # [B,H,KV_LEN_CAND]
+
+    # Mask out invalid (-1 blocks => negative tok) and tok>=seqlen
+    # We'll clamp invalid to 0 then mask them out by later slicing.
+    tok_valid = tok >= 0
+    # also causal is naturally satisfied because all selected blocks are from prefix; if not, enforce tok < seqlen
+    seqlen = seqlens_b.to(torch.int32)  # [B]
+    tok_valid &= tok < seqlen[:, None, None]
+
+    # For performance: keep a fixed kv_len by selecting only valid indices per (B,H) is annoying.
+    # Most people do B=1 decode; handle B=1 fast path (your config uses max_batch_size=1).
+    if B != 1:
+        raise NotImplementedError("Implement batching if you really need B>1; start with B=1 for speed.")
+
+    # B=1 fast path
+    tok0 = tok[0]            # [H,KV_LEN_CAND]
+    valid0 = tok_valid[0]    # [H,KV_LEN_CAND]
+
+    # Use the SAME kv_len across heads by taking union length (simple approach):
+    # pick tokens valid in ANY head, then gather for all heads.
+    # (If your block_index is the same across heads, this is identical.)
+    any_valid = valid0.any(dim=0)                # [KV_LEN_CAND]
+    tok_compact = tok0[0, any_valid].to(torch.int64)  # [kv_len] (use head 0 indices)
+
+    # Gather K/V: k_bhtd is [1,H,T,D] -> [H,kv_len,D] -> permute to [kv_len,H,D]
+    k_sel = k_bhtd[0, :, tok_compact, :]  # [H,kv_len,D]
+    v_sel = v_bhtd[0, :, tok_compact, :]  # [H,kv_len,D]
+    k_fi = k_sel.permute(1, 0, 2).contiguous()  # [kv_len,H,D]  (NHD)
+    v_fi = v_sel.permute(1, 0, 2).contiguous()  # [kv_len,H,D]
+
+    q_fi = q_bh1d[0, :, 0, :].contiguous()       # [H,D]
+
+    # FlashInfer decode (Hopper: set use_tensor_cores=True)
+    out = flashinfer.decode.single_decode_with_kv_cache(
+        q_fi, k_fi, v_fi,
+        kv_layout="NHD",
+        pos_encoding_mode="NONE",
+        use_tensor_cores=True,   # important for Hopper
+    )  # returns [H,D] :contentReference[oaicite:2]{index=2}
+
+    return out.unsqueeze(0).unsqueeze(2)  # [1,H,1,D]
+
 class Attention(nn.Module):
     def __init__(self, config: ModelArgs):
         super().__init__()
@@ -370,6 +445,66 @@ class Attention(nn.Module):
         self.register_buffer("protos_T", torch.randn(self.K, self.R) * 0.02)
 
         self.kv_cache: Optional[KVCache] = None
+
+
+    def _prof_init(self):
+        self._prof = {
+            "qkv_rope": 0.0,
+            "vnorm": 0.0,
+            "expand_heads": 0.0,
+            "cache_update": 0.0,
+            "blk_hash": 0.0,
+            "soft_hash": 0.0,
+            "score": 0.0,
+            "topk_build": 0.0,
+            "sparse_kernel": 0.0,
+            "wo": 0.0,
+            "dense_sdpa": 0.0,
+            "tokens_decode": 0,
+            "tokens_prefill": 0,
+        }
+
+    def _prof_print(self, prefix: str = "", reset: bool = True):
+        p = getattr(self, "_prof", None)
+        if not p:
+            print(prefix + "No profiling data.")
+            return
+
+        def fmt(name, ms_total, n):
+            if n == 0:
+                return f"{name:14s}: {ms_total:8.3f} ms total"
+            ms_tok = ms_total / n
+            tok_s = 1000.0 / ms_tok if ms_tok > 0 else float("inf")
+            return f"{name:14s}: {ms_total:8.3f} ms total | {ms_tok:7.4f} ms/tok | {tok_s:8.2f} tok/s"
+
+        ndec = p["tokens_decode"]
+        npre = p["tokens_prefill"]
+
+        if npre:
+            print(prefix + "=== Prefill breakdown ===")
+            print(prefix + fmt("qkv_rope", p["qkv_rope"], npre))
+            print(prefix + fmt("vnorm", p["vnorm"], npre))
+            print(prefix + fmt("expand_heads", p["expand_heads"], npre))
+            print(prefix + fmt("cache_update", p["cache_update"], npre))
+            print(prefix + fmt("blk_hash", p["blk_hash"], npre))
+            print(prefix + fmt("dense_sdpa", p["dense_sdpa"], npre))
+            print(prefix + fmt("wo", p["wo"], npre))
+
+        if ndec:
+            print(prefix + "=== Decode breakdown ===")
+            print(prefix + fmt("qkv_rope", p["qkv_rope"], ndec))
+            print(prefix + fmt("vnorm", p["vnorm"], ndec))
+            print(prefix + fmt("expand_heads", p["expand_heads"], ndec))
+            print(prefix + fmt("cache_update", p["cache_update"], ndec))
+            print(prefix + fmt("blk_hash", p["blk_hash"], ndec))
+            print(prefix + fmt("soft_hash", p["soft_hash"], ndec))
+            print(prefix + fmt("score", p["score"], ndec))
+            print(prefix + fmt("topk_build", p["topk_build"], ndec))
+            print(prefix + fmt("sparse_kernel", p["sparse_kernel"], ndec))
+            print(prefix + fmt("wo", p["wo"], ndec))
+
+        if reset:
+            self._prof_init()
 
     def pack_bits(self, bits: torch.Tensor) -> torch.Tensor:
         K = bits.shape[-1]
@@ -408,156 +543,188 @@ class Attention(nn.Module):
 
     def sparse_forward(
         self,
-        x: torch.Tensor,          # [B,S,dim]
+        x: torch.Tensor,
         freqs_cis: torch.Tensor,
-        attn_mask: torch.Tensor,  # [1,1,S,Tmax] (causal in your usage)
-        input_pos: Optional[torch.Tensor] = None,  # [S]
+        attn_mask: torch.Tensor,
+        input_pos: Optional[torch.Tensor] = None,
+        *,
+        profile: bool = False,
+        profile_print_every: int = 0,
     ) -> torch.Tensor:
-        assert input_pos is not None, "Need input_pos for cache update"
-        assert self.kv_cache is not None, "Call setup_caches first"
+        assert input_pos is not None
+        assert self.kv_cache is not None
+
+        use_cuda = x.is_cuda
+        timers_on = profile and use_cuda
+        if profile and not hasattr(self, "_prof"):
+            self._prof_init()
 
         B, S, _ = x.shape
-        kv_size = self.n_local_heads * self.head_dim
-        q, k, v = self.wqkv(x).split([self.dim, kv_size, kv_size], dim=-1)
+        bs = self.config.sparse_block_size
 
-        q = q.view(B, S, self.n_head, self.head_dim)              # [B,S,H,D]
-        k = k.view(B, S, self.n_local_heads, self.head_dim)       # [B,S,Hl,D]
-        v = v.view(B, S, self.n_local_heads, self.head_dim)       # [B,S,Hl,D]
+        # -------------------
+        # QKV + RoPE
+        # -------------------
+        with CUDATimer(timers_on) as t_qkv:
+            kv_size = self.n_local_heads * self.head_dim
+            q, k, v = self.wqkv(x).split([self.dim, kv_size, kv_size], dim=-1)
 
-        q = apply_rotary_emb(q, freqs_cis)
-        k = apply_rotary_emb(k, freqs_cis)
+            q = q.view(B, S, self.n_head, self.head_dim)
+            k = k.view(B, S, self.n_local_heads, self.head_dim)
+            v = v.view(B, S, self.n_local_heads, self.head_dim)
 
-        # v_norm (local heads)
-        with torch.no_grad():
+            q = apply_rotary_emb(q, freqs_cis)
+            k = apply_rotary_emb(k, freqs_cis)
+
+        # -------------------
+        # v_norm
+        # -------------------
+        with CUDATimer(timers_on) as t_vnorm:
             v_norm = torch.linalg.vector_norm(v.float(), ord=2, dim=-1).to(torch.float16)  # [B,S,Hl]
 
-        # Expand local KV -> full heads (so cache is (B,H,T,D))
-        assert self.n_head % self.n_local_heads == 0
-        rep = self.n_head // self.n_local_heads
-        if rep == 1:
-            k_full = k
-            v_full = v
-            v_norm_full = v_norm
-        else:
-            k_full = k.repeat_interleave(rep, dim=2)          # [B,S,H,D]
-            v_full = v.repeat_interleave(rep, dim=2)          # [B,S,H,D]
-            v_norm_full = v_norm.repeat_interleave(rep, dim=2)  # [B,S,H]
+        # -------------------
+        # expand local -> full heads (GQA)
+        # -------------------
+        with CUDATimer(timers_on) as t_expand:
+            rep = self.n_head // self.n_local_heads
+            if rep == 1:
+                k_full = k
+                v_full = v
+                v_norm_full = v_norm
+            else:
+                k_full = k.repeat_interleave(rep, dim=2)                # [B,S,H,D]
+                v_full = v.repeat_interleave(rep, dim=2)                # [B,S,H,D]
+                v_norm_full = v_norm.repeat_interleave(rep, dim=2)      # [B,S,H]
 
-        # Update caches and block accumulators
-        self.kv_cache.update_tokens(input_pos, k_full, v_full, v_norm_full)
+        # -------------------
+        # cache update
+        # -------------------
+        with CUDATimer(timers_on) as t_cache:
+            self.kv_cache.update_tokens(input_pos, k_full, v_full, v_norm_full)
 
-        # ------------------------------------------------------------------
-        # Incremental block hashing (NO LOOPS): update only blocks touched by input_pos
-        # ------------------------------------------------------------------
-        bs = self.config.sparse_block_size
-        with torch.no_grad():
-            # touched block ids
-            blk_ids = (input_pos.to(torch.int64) // bs)            # [S]
-            blk_ids = torch.unique(blk_ids)                        # [U]
-            blk_ids = blk_ids.clamp_(0, self.kv_cache.Tb - 1)      # in range
+        # -------------------
+        # incremental block hashing
+        # -------------------
+        with CUDATimer(timers_on) as t_bhash:
+            blk_ids = (input_pos.to(torch.int64) // bs)
+            blk_ids = torch.unique(blk_ids)
+            blk_ids = blk_ids.clamp_(0, self.kv_cache.Tb - 1)
 
-            # Gather sums / counts for these blocks
-            # k_sum_blk: (B,H,Tb,D) -> (B,H,U,D)
-            k_sum = self.kv_cache.k_sum_blk.index_select(2, blk_ids)
+            k_sum = self.kv_cache.k_sum_blk.index_select(2, blk_ids)                 # (B,H,U,D)
+            cnt = self.kv_cache.k_cnt_blk.index_select(1, blk_ids).clamp_min(1)      # (B,U)
+            k_rep = k_sum / cnt[:, None, :, None]                                    # (B,H,U,D)
 
-            # k_cnt_blk: (B,Tb) -> (B,U)
-            cnt = self.kv_cache.k_cnt_blk.index_select(1, blk_ids).clamp_min(1).to(torch.float32)
-
-            # Representative keys for blocks: (B,H,U,D)
-            k_rep = k_sum / cnt[:, None, :, None]
-
-            # Hash expects [B,T,H,D], T=U. So permute -> (B,U,H,D)
-            codes = self.hard_hash_anyheads(k_rep.permute(0, 2, 1, 3).contiguous())  # (B,U,H,L) int16
-
-            # Store into k_hard_blk: (B,H,L,Tb) at blocks blk_ids along dim=3
-            # codes: (B,U,H,L) -> (B,H,L,U)
+            codes = self.hard_hash_anyheads(k_rep.permute(0, 2, 1, 3).contiguous())  # (B,U,H,L)
             self.kv_cache.k_hard_blk.index_copy_(
-                dim=3,
-                index=blk_ids,
-                source=codes.permute(0, 2, 3, 1).contiguous()
+                dim=3, index=blk_ids, source=codes.permute(0, 2, 3, 1).contiguous()
             )
 
-        # ------------------------------------------------------------------
-        # Prefill: dense SDPA for correctness
-        # ------------------------------------------------------------------
+        # -------------------
+        # Prefill (dense SDPA)
+        # -------------------
         if S != 1:
             T = int(self.kv_cache.prefill_len.item())
-            assert T > 0
+            q_sdpa = q.transpose(1, 2).contiguous()
+            k_sdpa = self.kv_cache.k_cache[:, :, :T, :].contiguous()
+            v_sdpa = self.kv_cache.v_cache[:, :, :T, :].contiguous()
 
-            # SDPA expects [B,H,S,D] and [B,H,T,D]
-            q_sdpa = q.transpose(1, 2).contiguous()                      # [B,H,S,D]
-            k_sdpa = self.kv_cache.k_cache[:, :, :T, :].contiguous()     # [B,H,T,D]
-            v_sdpa = self.kv_cache.v_cache[:, :, :T, :].contiguous()     # [B,H,T,D]
+            with CUDATimer(timers_on) as t_sdpa:
+                y = F.scaled_dot_product_attention(
+                    q_sdpa, k_sdpa, v_sdpa,
+                    attn_mask=attn_mask[..., :T],
+                    dropout_p=0.0
+                )
+            with CUDATimer(timers_on) as t_wo:
+                y = y.transpose(1, 2).contiguous().view(B, S, self.dim)
+                out = self.wo(y)
 
-            y = F.scaled_dot_product_attention(
-                q_sdpa, k_sdpa, v_sdpa,
-                attn_mask=attn_mask[..., :T],
-                dropout_p=0.0
-            )
-            y = y.transpose(1, 2).contiguous().view(B, S, self.dim)
-            return self.wo(y)
+            if timers_on:
+                torch.cuda.synchronize()
+                self._prof["qkv_rope"] += t_qkv.ms()
+                self._prof["vnorm"] += t_vnorm.ms()
+                self._prof["expand_heads"] += t_expand.ms()
+                self._prof["cache_update"] += t_cache.ms()
+                self._prof["blk_hash"] += t_bhash.ms()
+                self._prof["dense_sdpa"] += t_sdpa.ms()
+                self._prof["wo"] += t_wo.ms()
+                self._prof["tokens_prefill"] += S
 
-        # ------------------------------------------------------------------
-        # Decode: routing + sparse decode
-        # ------------------------------------------------------------------
+            return out
+
+        # -------------------
+        # Decode (routing + sparse kernel)
+        # -------------------
         T = int(self.kv_cache.prefill_len.item())
-        assert T > 0
-
         Tb = (T + bs - 1) // bs
 
-        # Q: [B,H,1,D]
-        q_bh1d = q.transpose(1, 2).contiguous()  # [B,H,1,D]
-
-        # KV already in (B,H,T,D)
+        q_bh1d = q.transpose(1, 2).contiguous()          # [B,H,1,D]
         k_bhtd = self.kv_cache.k_cache[:, :, :T, :]
         v_bhtd = self.kv_cache.v_cache[:, :, :T, :]
+        v_norm_blk_bhtb = self.kv_cache.v_norm_blk[:, :, :Tb]
+        k_hard_blk_bhltb = self.kv_cache.k_hard_blk[:, :, :, :Tb]
 
-        # Routing metadata (full-head)
-        v_norm_blk_bhtb = self.kv_cache.v_norm_blk[:, :, :Tb]       # (B,H,Tb)
-        k_hard_blk_bhltb = self.kv_cache.k_hard_blk[:, :, :, :Tb]   # (B,H,L,Tb)
-
-        # ------------------------------------------------------------------
-        # Causal-only: remove mask -> block reduction entirely
-        # kernel enforces cols < seqlen and cols <= q_pos
-        # ------------------------------------------------------------------
         allowed_blk_bhtb = torch.ones((B, self.n_head, Tb), device=x.device, dtype=torch.bool)
 
-        # Soft query probs
-        q_bhd = q_bh1d[:, :, 0, :].contiguous()  # (B,H,D)
-        q_probs = self.soft_hash(q_bhd)          # (B,H,L,R)
+        with CUDATimer(timers_on) as t_soft:
+            q_bhd = q_bh1d[:, :, 0, :].contiguous()
+            q_probs = self.soft_hash(q_bhd)
 
-        # Block scores
-        scores = soft_hash_score_ext.soft_hash_score(
-            q_probs.to(torch.float16).contiguous(),
-            k_hard_blk_bhltb.to(torch.int16).contiguous(),
-            v_norm_blk_bhtb.to(torch.float16).contiguous(),
-            allowed_blk_bhtb.contiguous(),
-        )  # (B,H,Tb)
+        with CUDATimer(timers_on) as t_score:
+            scores = soft_hash_score_ext.soft_hash_score(
+                q_probs.to(torch.float16).contiguous(),
+                k_hard_blk_bhltb.to(torch.int16).contiguous(),
+                v_norm_blk_bhtb.to(torch.float16).contiguous(),
+                allowed_blk_bhtb.contiguous(),
+            )
 
-        Mb = max(1, min(self.config.heavy_const // bs, Tb))
+        with CUDATimer(timers_on) as t_topk:
+            Mb = max(1, min(self.config.heavy_const // bs, Tb))
+            block_index = build_block_index(
+                scores_bhtb=scores,
+                T=T,
+                bs=bs,
+                sink_tokens=self.config.sink_size,
+                window_tokens=self.config.window_size,
+                Mb=Mb,
+            )
 
-        block_index = build_block_index(
-            scores_bhtb=scores,
-            T=T,
-            bs=bs,
-            sink_tokens=self.config.sink_size,
-            window_tokens=self.config.window_size,
-            Mb=Mb,
-        )  # (B,H,KLIST) int32
+        with CUDATimer(timers_on) as t_kernel:
+            seqlens_b = torch.full((B,), T, device=x.device, dtype=torch.int32)
+            out_bh1d = rw_decode_sparse_attention(
+                q_bh1d.to(self.config.cache_dtype),
+                k_bhtd.to(self.config.cache_dtype).contiguous(),
+                v_bhtd.to(self.config.cache_dtype).contiguous(),
+                seqlens_b,
+                block_index,
+                bs,
+            )
+        with CUDATimer(timers_on) as t_wo:
+            y = out_bh1d.transpose(1, 2).contiguous().view(B, 1, self.dim)
+            out = self.wo(y)
 
-        seqlens_b = torch.full((B,), T, device=x.device, dtype=torch.int32)
+        if timers_on:
+            torch.cuda.synchronize()
+            self._prof["qkv_rope"] += t_qkv.ms()
+            self._prof["vnorm"] += t_vnorm.ms()
+            self._prof["expand_heads"] += t_expand.ms()
+            self._prof["cache_update"] += t_cache.ms()
+            self._prof["blk_hash"] += t_bhash.ms()
+            self._prof["soft_hash"] += t_soft.ms()
+            self._prof["score"] += t_score.ms()
+            self._prof["topk_build"] += t_topk.ms()
+            self._prof["sparse_kernel"] += t_kernel.ms()
+            self._prof["wo"] += t_wo.ms()
+            self._prof["tokens_decode"] += 1
 
-        out_bh1d = rw_decode_sparse_attention(
-            q=q_bh1d.to(self.config.cache_dtype),
-            k=k_bhtd.to(self.config.cache_dtype),
-            v=v_bhtd.to(self.config.cache_dtype),
-            seqlens=seqlens_b,
-            block_index=block_index,
-            block_n=bs,
-        )  # (B,H,1,D)
+            if profile_print_every and (self._prof["tokens_decode"] % profile_print_every == 0):
+                # Print effective sparsity info too
+                KLIST = block_index.shape[-1]
+                eff_tokens = KLIST * bs
+                print(f"[sparse decode] T={T} Tb={Tb} bs={bs} Mb={Mb} KLIST={KLIST} eff_tokens~{eff_tokens}")
+                self._prof_print(prefix="[sparse prof] ", reset=True)
 
-        y = out_bh1d.transpose(1, 2).contiguous().view(B, 1, self.dim)
-        return self.wo(y)
+        return out
+
 
 
     def forward(self, x: Tensor, freqs_cis: Tensor, mask: BlockMask, input_pos: Optional[Tensor] = None) -> Tensor:
@@ -578,6 +745,7 @@ class Attention(nn.Module):
         if self.kv_cache is not None:
             k, v = self.kv_cache.update(input_pos, k, v)
 
+        print("Number of keys:", k.shape[2])  # After transpose, shape is (batch, n_local_heads, seqlen, head_dim)
         y = F.scaled_dot_product_attention(
             q, k, v,
             attn_mask=None,          # or a proper bool mask if needed
@@ -647,15 +815,16 @@ class Transformer(nn.Module):
         logits = self.output(x)
         return logits
 
-    def sparse_forward(self, idx: Tensor, input_pos: Optional[Tensor] = None) -> Tensor:
-        assert self.freqs_cis is not None, "Caches must be initialized first"
+    def sparse_forward(self, idx: Tensor, input_pos: Optional[Tensor] = None, *, profile=False, profile_print_every=0) -> Tensor:
+        assert self.freqs_cis is not None
         mask = self.causal_mask[None, None, input_pos]
         freqs_cis = self.freqs_cis[input_pos]
         x = self.tok_embeddings(idx)
         for layer in self.layers:
-            x = layer.sparse_forward(x, input_pos, freqs_cis, mask)
+            x = layer.sparse_forward(x, input_pos, freqs_cis, mask, profile=profile, profile_print_every=profile_print_every)
         x = self.norm(x)
         return self.output(x)
+
 
     @classmethod
     def from_name(cls, name: str):
@@ -675,10 +844,12 @@ class TransformerBlock(nn.Module):
         out = h + self.feed_forward(self.ffn_norm(h))
         return out
 
-    def sparse_forward(self, x: Tensor, input_pos: Tensor, freqs_cis: Tensor, mask: Tensor) -> Tensor:
-        h = x + self.attention.sparse_forward(self.attention_norm(x), freqs_cis, mask, input_pos)
+    def sparse_forward(self, x, input_pos, freqs_cis, mask, profile=False, profile_print_every=0):
+        h = x + self.attention.sparse_forward(self.attention_norm(x), freqs_cis, mask, input_pos,
+                                            profile=profile, profile_print_every=profile_print_every)
         out = h + self.feed_forward(self.ffn_norm(h))
         return out
+
 
 
 class FeedForward(nn.Module):
