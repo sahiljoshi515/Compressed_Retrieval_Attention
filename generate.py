@@ -23,6 +23,47 @@ sys.path.append(str(wd))
 from model import Transformer
 from tp import maybe_init_dist
 from sentencepiece import SentencePieceProcessor
+from kernels.sparse import sparse_attention_fwd
+
+
+@torch.no_grad()
+def warmup_triton_sparse_attention(model: Transformer, device: torch.device, *, block_seq: int = 256):
+    """
+    Compile Triton sparse kernels before generation so first decode token isn't slow.
+    Call after model.setup_caches(...) and model.to(device).
+    """
+    # Pick one layer's attention (all layers share same head shapes)
+    attn = model.layers[0].attention
+    B = 1
+    H = attn.n_head
+    Kv = attn.n_local_heads
+    D = attn.head_dim
+    Ktotal = int(attn.heavy_const)
+
+    # Match real dtype you use for query/key/value in decode
+    # Your sparse_forward passes q_bhd, k_backend, v_backend into sparse_attention_fwd.
+    # In your code q_bhd is whatever dtype q is (likely bf16).
+    dtype = torch.bfloat16
+
+    # Use a representative T; compilation doesn't depend on runtime T,
+    # but allocating mid buffers depends on sparse_len max.
+    # Use Ktotal because sparse_len is Ktotal in your dummy path.
+    S = max(Ktotal, 64)
+
+    q = torch.empty((B, H, D), device=device, dtype=dtype)
+    k = torch.empty((B, Kv, S, D), device=device, dtype=dtype)
+    v = torch.empty((B, Kv, S, D), device=device, dtype=dtype)
+
+    # indices 0..Ktotal-1
+    sparse_list = torch.arange(0, Ktotal, device=device, dtype=torch.int32)[None, None, :].expand(B, H, Ktotal).contiguous()
+    sparse_len = torch.full((B, H), Ktotal, device=device, dtype=torch.int32)
+
+    # A couple runs to ensure stage1+stage2 compile and the driver finishes
+    for _ in range(2):
+        _ = sparse_attention_fwd(q, k, v, sparse_list, sparse_len, block_seq=block_seq)
+
+    torch.cuda.synchronize()
+
 
 def multinomial_sample_one_no_sync(probs_sort): # Does multinomial sampling without a cuda synchronization
     q = torch.empty_like(probs_sort).exponential_(1)
@@ -188,7 +229,8 @@ def generate(
         model.setup_caches(max_batch_size=batch_size, max_seq_length=max_seq_length)
         if is_speculative and draft_model is not model:
             draft_model.setup_caches(max_batch_size=batch_size, max_seq_length=max_seq_length)
-
+    
+    warmup_triton_sparse_attention(model, torch.device("cuda"), block_seq=256)
     # create an empty tensor of the expected final shape and fill in the current tokens
     empty = torch.empty((batch_size, T_new), dtype=dtype, device=device)
     empty[:,:T] = prompt
@@ -508,7 +550,7 @@ if __name__ == '__main__':
     parser.add_argument('--prompt_file', type=Path, default=None, help='Path to a text file containing the prompt (avoids argument length limits).')
     parser.add_argument('--interactive', action='store_true', help='Whether to launch in interactive mode')
     parser.add_argument('--num_samples', type=int, default=1, help='Number of samples.')
-    parser.add_argument('--max_new_tokens', type=int, default=10000, help='Maximum number of new tokens.')
+    parser.add_argument('--max_new_tokens', type=int, default=50, help='Maximum number of new tokens.')
     parser.add_argument('--top_k', type=int, default=200, help='Top-k for sampling.')
     parser.add_argument('--temperature', type=float, default=0.8, help='Temperature for sampling.')
     parser.add_argument('--checkpoint_path', type=Path, default=Path("/scratch/sj157/Compressed_Retrieval_Attention/checkpoints/meta-llama/Llama-2-7b-chat-hf/model.pth"), help='Model checkpoint path.')

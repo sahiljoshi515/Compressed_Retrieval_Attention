@@ -19,9 +19,84 @@ def find_multiple(n: int, k: int) -> int:
         return n
     return n + k - (n % k)
 
+class CUDATimer:
+    __slots__ = ("enabled", "start", "end")
+
+    def __init__(self, enabled: bool):
+        self.enabled = enabled
+        if enabled:
+            self.start = torch.cuda.Event(enable_timing=True)
+            self.end = torch.cuda.Event(enable_timing=True)
+        else:
+            self.start = None
+            self.end = None
+
+    def __enter__(self):
+        if self.enabled:
+            self.start.record()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if self.enabled:
+            self.end.record()
+
+    def ms(self) -> float:
+        if not self.enabled:
+            return 0.0
+        return self.start.elapsed_time(self.end)
+
+
+def _prof_init(attn_obj):
+    attn_obj._prof = {
+        "qkv_rope": 0.0,
+        "cache_update": 0.0,
+        "index_build": 0.0,
+        "kv_relayout": 0.0,
+        "sparse_kernel": 0.0,
+        "wo": 0.0,
+        "tokens_decode": 0,
+        "tokens_prefill": 0,
+    }
+
+
+def _prof_print(attn_obj, prefix="[tok-sparse prof] ", reset=True):
+    p = getattr(attn_obj, "_prof", None)
+    if not p:
+        print(prefix + "No profiling data.")
+        return
+
+    def fmt(name, ms_total, n):
+        if n == 0:
+            return f"{name:14s}: {ms_total:8.3f} ms total"
+        ms_tok = ms_total / n
+        tok_s = 1000.0 / ms_tok if ms_tok > 0 else float("inf")
+        return f"{name:14s}: {ms_total:8.3f} ms total | {ms_tok:7.4f} ms/tok | {tok_s:8.2f} tok/s"
+
+    ndec = p["tokens_decode"]
+    npre = p["tokens_prefill"]
+
+    if npre:
+        print(prefix + "=== Prefill breakdown ===")
+        print(prefix + fmt("qkv_rope", p["qkv_rope"], npre))
+        print(prefix + fmt("cache_update", p["cache_update"], npre))
+        print(prefix + fmt("wo", p["wo"], npre))
+
+    if ndec:
+        print(prefix + "=== Decode breakdown ===")
+        print(prefix + fmt("qkv_rope", p["qkv_rope"], ndec))
+        print(prefix + fmt("cache_update", p["cache_update"], ndec))
+        print(prefix + fmt("kv_relayout", p["kv_relayout"], ndec))
+        print(prefix + fmt("index_build", p["index_build"], ndec))
+        print(prefix + fmt("sparse_kernel", p["sparse_kernel"], ndec))
+        print(prefix + fmt("wo", p["wo"], ndec))
+
+    if reset:
+        _prof_init(attn_obj)
+
+
 @dataclass
 class ModelArgs:
-    block_size: int = 16384
+    block_size: int = 163844
     vocab_size: int = 32000
     n_layer: int = 32
     n_head: int = 32
@@ -71,8 +146,8 @@ class KVCache(nn.Module):
         B, T, H, D = max_batch_size, max_seq_length, n_heads, head_dim
 
         # Store as [B, T, H, D] for easier CSR lookup by token position
-        self.register_buffer("k_cache", torch.zeros((B, T, H, D), dtype=dtype))
-        self.register_buffer("v_cache", torch.zeros((B, T, H, D), dtype=dtype))
+        self.register_buffer("k_cache", torch.zeros((B, H, T, D), dtype=dtype))
+        self.register_buffer("v_cache", torch.zeros((B, H, T, D), dtype=dtype))
 
         self.L = L
         self.R = R
@@ -94,8 +169,8 @@ class KVCache(nn.Module):
         v_val: [B, S, H, D]
         """
         assert input_pos.shape[0] == k_val.shape[1]
-        self.k_cache[:, input_pos] = k_val
-        self.v_cache[:, input_pos] = v_val
+        self.k_cache[:, :, input_pos, :] = k_val.permute(0, 2, 1, 3)  # (B,Hl,S,D)
+        self.v_cache[:, :, input_pos, :] = v_val.permute(0, 2, 1, 3)
 
         if v_norm is not None:
             self.v_norm[:, input_pos] = v_norm
@@ -156,15 +231,26 @@ class Transformer(nn.Module):
         logits = self.output(x)
         return logits
     
-    def sparse_forward(self, idx: Tensor, input_pos: Optional[Tensor] = None) -> Tensor:
-        assert self.freqs_cis is not None, "Caches must be initialized first"
-        mask = self.causal_mask[None, None, input_pos]        # keep same mask type/shape
+    def sparse_forward(self, idx: Tensor, input_pos: Optional[Tensor] = None, *, profile=False, profile_print_every=100) -> Tensor:
+        assert self.freqs_cis is not None
+        mask = self.causal_mask[None, None, input_pos]
         freqs_cis = self.freqs_cis[input_pos]
         x = self.tok_embeddings(idx)
         for layer in self.layers:
-            x = layer.sparse_forward(x, input_pos, freqs_cis, mask)
+            x = layer.attention.sparse_forward(
+                layer.attention_norm(x),
+                freqs_cis,
+                mask,
+                None,
+                input_pos,
+                profile=profile,
+                profile_print_every=profile_print_every,
+            )
+            # keep rest of block structure
+            x = x + layer.feed_forward(layer.ffn_norm(x))
         x = self.norm(x)
         return self.output(x)
+
 
     @classmethod
     def from_name(cls, name: str):
@@ -409,39 +495,45 @@ class Attention(nn.Module):
         self,
         x: torch.Tensor,
         freqs_cis: torch.Tensor,
-        mask1: torch.Tensor,      # [1,1,S,Tmax] bool (for dense prefill)
+        mask1: torch.Tensor,      # [1,1,S,Tmax] bool (dense prefill)
         mask2: torch.Tensor,      # unused
         input_pos: Optional[torch.Tensor] = None,
+        *,
+        profile: bool = False,
+        profile_print_every: int = 0,
     ) -> torch.Tensor:
         assert input_pos is not None, "sparse_forward expects input_pos"
         bsz, seqlen, _ = x.shape
-        assert self.kv_cache is not None, "Call setup_caches() first so kv_cache exists"
+        assert self.kv_cache is not None, "Call setup_caches() first"
 
-        # ---- QKV ----
-        kv_size = self.n_local_heads * self.head_dim
-        q, k, v = self.wqkv(x).split([self.dim, kv_size, kv_size], dim=-1)
+        timers_on = profile and x.is_cuda
+        if profile and not hasattr(self, "_prof"):
+            _prof_init(self)
 
-        q = q.view(bsz, seqlen, self.n_head, self.head_dim)             # [B,S,H,D]
-        k = k.view(bsz, seqlen, self.n_local_heads, self.head_dim)      # [B,S,Hl,D]
-        v = v.view(bsz, seqlen, self.n_local_heads, self.head_dim)      # [B,S,Hl,D]
+        # ---- QKV + RoPE ----
+        with CUDATimer(timers_on) as t_qkv:
+            kv_size = self.n_local_heads * self.head_dim
+            q, k, v = self.wqkv(x).split([self.dim, kv_size, kv_size], dim=-1)
 
-        q = apply_rotary_emb(q, freqs_cis)
-        k = apply_rotary_emb(k, freqs_cis)
+            q = q.view(bsz, seqlen, self.n_head, self.head_dim)             # [B,S,H,D]
+            k = k.view(bsz, seqlen, self.n_local_heads, self.head_dim)      # [B,S,Hl,D]
+            v = v.view(bsz, seqlen, self.n_local_heads, self.head_dim)      # [B,S,Hl,D]
 
-        # ---- KV cache update (NO hashing) ----
-        # Assumes kv_cache.update can be called without v_norm/k_hard.
-        # If your update() requires those args, make them optional in kv_cache.update.
-        k_cache, v_cache = self.kv_cache.update(input_pos, k, v)  # [B,Tmax,Hl,D]
+            q = apply_rotary_emb(q, freqs_cis)
+            k = apply_rotary_emb(k, freqs_cis)
 
+        # ---- cache update ----
+        with CUDATimer(timers_on) as t_cache:
+            k_cache, v_cache = self.kv_cache.update(input_pos, k, v)  # [B,Tmax,Hl,D] in your KVCache
+
+        T = int(self.kv_cache.prefill_len.item())
         # ---- Dense prefill / chunked decode ----
         if seqlen != 1:
-            # SDPA expects [B,H,S,D] and [B,H,T,D]
+            # dense path: keep it simple and profile only qkv/cache/wo (SDPA excluded here)
             assert self.n_head % self.n_local_heads == 0
             rep = self.n_head // self.n_local_heads
 
             q_sdpa = q.transpose(1, 2)  # [B,H,S,D]
-
-            # Expand local-head cache to global heads for dense path only
             if rep == 1:
                 k_full = k_cache
                 v_full = v_cache
@@ -449,57 +541,94 @@ class Attention(nn.Module):
                 k_full = k_cache.repeat_interleave(rep, dim=2)
                 v_full = v_cache.repeat_interleave(rep, dim=2)
 
-            k_sdpa = k_full.transpose(1, 2)  # [B,H,Tmax,D]
-            v_sdpa = v_full.transpose(1, 2)  # [B,H,Tmax,D]
+            k_sdpa = k_full
+            v_sdpa = v_full
 
-            y = F.scaled_dot_product_attention(
-                q_sdpa, k_sdpa, v_sdpa,
-                attn_mask=mask1,
-                dropout_p=0.0,
-            )  # [B,H,S,D]
+            
+            k_sdpa = k_sdpa[:, :, :T, :]
+            v_sdpa = v_sdpa[:, :, :T, :]
+            mask_sdpa = mask1[..., :T]  # [1,1,S,T] broadcastable
+            y = F.scaled_dot_product_attention(q_sdpa, k_sdpa, v_sdpa, attn_mask=mask_sdpa, dropout_p=0.0)
+            with CUDATimer(timers_on) as t_wo:
+                y = y.transpose(1, 2).contiguous().view(bsz, seqlen, self.dim)
+                out = self.wo(y)
 
-            y = y.transpose(1, 2).contiguous().view(bsz, seqlen, self.dim)
-            return self.wo(y)
+            if timers_on:
+                torch.cuda.synchronize()
+                self._prof["qkv_rope"] += t_qkv.ms()
+                self._prof["cache_update"] += t_cache.ms()
+                self._prof["wo"] += t_wo.ms()
+                self._prof["tokens_prefill"] += seqlen
+            return out
 
-        # ---- True decode (S == 1): sparse backend with dummy last-128 indices ----
+        # ---- True decode: token-level sparse list -> sparse_attention_fwd ----
         T = int(self.kv_cache.prefill_len.item())
         assert T > 0
 
         # Query: [B,H,D]
         q_bhd = q.transpose(1, 2)[:, :, 0, :].contiguous()
 
-        # Backend expects K/V as local-head layout [B,Hl,T,D]
-        k_backend = k_cache[:, :T].permute(0, 2, 1, 3).contiguous()  # [B,Hl,T,D]
-        v_backend = v_cache[:, :T].permute(0, 2, 1, 3).contiguous()  # [B,Hl,T,D]
+        # IMPORTANT: this relayout can dominate if you do it every token.
+        # Your KVCache stores [B,T,H,D]; backend wants [B,H,T,D] or [B,Hl,T,D].
+        # This permute+contiguous is a *copy*. Profile it separately.
+        with CUDATimer(timers_on) as t_relayout:
+            k_backend = self.kv_cache.k_cache[:, :, :T, :]   # view, no copy
+            v_backend = self.kv_cache.v_cache[:, :, :T, :]
 
-        # Dummy sparse list: last 128 tokens
-        Ktotal = min(128, T)
-        start = T - Ktotal
+        # ---- token-level index build (dummy or real) ----
+        with CUDATimer(timers_on) as t_index:
+            # Dummy: last K tokens (token-level sparsity)
+            Ktotal = min(int(self.heavy_const), T)  # uses your heavy_const as token budget
+            start = T - Ktotal
 
-        # Optional: reuse buffers to avoid per-token allocations
-        if getattr(self, "_dummy_sparse_buf", None) is None or self._dummy_sparse_buf.shape[-1] < Ktotal:
-            cap = max(Ktotal, 128)
-            self._dummy_idx_buf = torch.empty((cap,), device=x.device, dtype=torch.int32)
-            self._dummy_sparse_buf = torch.empty((1, self.n_head, cap), device=x.device, dtype=torch.int32)
-            self._dummy_len_buf = torch.empty((1, self.n_head), device=x.device, dtype=torch.int32)
+            # reuse buffers to avoid per-token allocations
+            if getattr(self, "_tok_sparse_buf", None) is None or self._tok_sparse_buf.shape[-1] < Ktotal:
+                cap = max(Ktotal, int(self.heavy_const))
+                self._tok_idx_buf = torch.empty((cap,), device=x.device, dtype=torch.int32)
+                self._tok_sparse_buf = torch.empty((bsz, self.n_head, cap), device=x.device, dtype=torch.int32)
+                self._tok_len_buf = torch.empty((bsz, self.n_head), device=x.device, dtype=torch.int32)
 
-        idx = self._dummy_idx_buf[:Ktotal]
-        idx.copy_(torch.arange(start, T, device=x.device, dtype=torch.int32))
+            idx = self._tok_idx_buf[:Ktotal]
+            idx.copy_(torch.arange(start, T, device=x.device, dtype=torch.int32))
 
-        sparse_list = self._dummy_sparse_buf[:, :, :Ktotal]
-        sparse_list.copy_(idx.view(1, 1, Ktotal).expand(1, self.n_head, Ktotal))
+            sparse_list = self._tok_sparse_buf[:, :, :Ktotal]
+            sparse_list.copy_(idx.view(1, 1, Ktotal).expand(bsz, self.n_head, Ktotal))
 
-        sparse_len = self._dummy_len_buf
-        sparse_len.fill_(Ktotal)
+            sparse_len = self._tok_len_buf
+            sparse_len.fill_(Ktotal)
 
-        out_bhd = sparse_attention_fwd(
-            q_bhd, k_backend, v_backend,
-            sparse_list, sparse_len,
-            block_seq=256,
-        )  # [B,H,D]
+            # ---- If you want REAL token-level routing, this is where it goes ----
+            # sparse_list, sparse_len = build_sparse_list_decode(...)
+            # Ensure they are int32 contiguous and reuse buffers if your builder supports it.
 
-        y = out_bhd.unsqueeze(2).transpose(1, 2).contiguous().view(bsz, 1, self.dim)
-        return self.wo(y)
+        # ---- sparse kernel ----
+        with CUDATimer(timers_on) as t_kernel:
+            out_bhd = sparse_attention_fwd(
+                q_bhd, k_backend, v_backend,
+                sparse_list, sparse_len,
+                block_seq=256,
+            )  # [B,H,D]
+
+        with CUDATimer(timers_on) as t_wo:
+            y = out_bhd.unsqueeze(2).transpose(1, 2).contiguous().view(bsz, 1, self.dim)
+            out = self.wo(y)
+
+        if timers_on:
+            torch.cuda.synchronize()
+            self._prof["qkv_rope"] += t_qkv.ms()
+            self._prof["cache_update"] += t_cache.ms()
+            self._prof["kv_relayout"] += t_relayout.ms()
+            self._prof["index_build"] += t_index.ms()
+            self._prof["sparse_kernel"] += t_kernel.ms()
+            self._prof["wo"] += t_wo.ms()
+            self._prof["tokens_decode"] += 1
+
+            if profile_print_every and (self._prof["tokens_decode"] % profile_print_every == 0):
+                print(f"[tok-sparse decode] T={T} Ktotal={Ktotal} (token-level)")
+                _prof_print(self, prefix="[tok-sparse prof] ", reset=True)
+
+        return out
+
 
 
     def forward(self, x: Tensor, freqs_cis: Tensor, mask: Tensor, input_pos: Optional[Tensor] = None) -> Tensor:
@@ -518,18 +647,18 @@ class Attention(nn.Module):
 
         # ---- IMPORTANT: update cache BEFORE transpose ----
         if self.kv_cache is not None:
-            k_cache, v_cache = self.kv_cache.update(input_pos, k, v)    # [B,T,Hl,D]
+            k_cache, v_cache = self.kv_cache.update(input_pos, k, v)    # [B,Hl,T,D]
             k = k_cache
             v = v_cache
 
         # now transpose for attention math
-        q = q.transpose(1, 2)                                           # [B,H,S,D]
-        k = k.transpose(1, 2)                                           # [B,Hl,T,D]
-        v = v.transpose(1, 2)                                           # [B,Hl,T,D]
+        # transpose only q; k/v are already [B, Hl, T, D] after cache update
+        q = q.transpose(1, 2)  # [B, H, S, D]
 
-        # expand local heads to global heads
-        k = k.repeat_interleave(self.n_head // self.n_local_heads, dim=1)  # [B,H,T,D]
-        v = v.repeat_interleave(self.n_head // self.n_local_heads, dim=1)  # [B,H,T,D]
+        # expand local heads to global heads (k/v are [B, Hl, T, D])
+        rep = self.n_head // self.n_local_heads
+        k = k.repeat_interleave(rep, dim=1)  # [B, H, T, D]
+        v = v.repeat_interleave(rep, dim=1)  # [B, H, T, D]
 
         y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0)
         y = y.transpose(1, 2).contiguous().view(bsz, seqlen, self.dim)
