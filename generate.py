@@ -23,44 +23,89 @@ sys.path.append(str(wd))
 from model import Transformer
 from tp import maybe_init_dist
 from sentencepiece import SentencePieceProcessor
-from kernels.sparse import sparse_attention_fwd
-
+from kernels.sparse import build_sparse_list_decode, sparse_attention_fwd
 
 @torch.no_grad()
-def warmup_triton_sparse_attention(model: Transformer, device: torch.device, *, block_seq: int = 256):
+def warmup_triton_sparse_decode(model: Transformer, device: torch.device, *, T: int = 4096, block_seq: int = 256):
     """
-    Compile Triton sparse kernels before generation so first decode token isn't slow.
-    Call after model.setup_caches(...) and model.to(device).
+    Warm up BOTH:
+      - build_sparse_list_decode (index_build)
+      - sparse_attention_fwd (sparse_kernel)
+
+    Call after model.setup_caches(...) and model is on `device`.
     """
-    # Pick one layer's attention (all layers share same head shapes)
     attn = model.layers[0].attention
     B = 1
     H = attn.n_head
-    Kv = attn.n_local_heads
+    Hl = attn.n_local_heads
     D = attn.head_dim
+    L = attn.L
+    R = attn.R
     Ktotal = int(attn.heavy_const)
 
-    # Match real dtype you use for query/key/value in decode
-    # Your sparse_forward passes q_bhd, k_backend, v_backend into sparse_attention_fwd.
-    # In your code q_bhd is whatever dtype q is (likely bf16).
-    dtype = torch.bfloat16
+    # representative decode length (prefix length)
+    T = int(T)
+    T = max(T, 256)  # avoid tiny degenerate shapes
 
-    # Use a representative T; compilation doesn't depend on runtime T,
-    # but allocating mid buffers depends on sparse_len max.
-    # Use Ktotal because sparse_len is Ktotal in your dummy path.
-    S = max(Ktotal, 64)
+    # Build dummy inputs on device
+    q_bhd = torch.empty((B, H, D), device=device, dtype=torch.bfloat16)
 
-    q = torch.empty((B, H, D), device=device, dtype=dtype)
-    k = torch.empty((B, Kv, S, D), device=device, dtype=dtype)
-    v = torch.empty((B, Kv, S, D), device=device, dtype=dtype)
+    # q_probs: [B,H,L,R]
+    q_probs = torch.empty((B, H, L, R), device=device, dtype=torch.bfloat16).normal_()
 
-    # indices 0..Ktotal-1
-    sparse_list = torch.arange(0, Ktotal, device=device, dtype=torch.int32)[None, None, :].expand(B, H, Ktotal).contiguous()
-    sparse_len = torch.full((B, H), Ktotal, device=device, dtype=torch.int32)
+    # k_hard_bhlt: [B,H,L,T] int16 in [0, R-1]
+    k_hard_bhlt = torch.randint(
+        low=0, high=R, size=(B, H, L, T), device=device, dtype=torch.int16
+    )
 
-    # A couple runs to ensure stage1+stage2 compile and the driver finishes
+    # v_norm_bht: [B,H,T] fp16
+    v_norm_bht = torch.rand((B, H, T), device=device, dtype=torch.float16)
+
+    # allowed_bht: [B,H,T] bool
+    allowed_bht = torch.ones((B, H, T), device=device, dtype=torch.bool)
+
+    # k/v backend: [B,Hl,T,D] bf16
+    k_backend = torch.empty((B, Hl, T, D), device=device, dtype=torch.bfloat16)
+    v_backend = torch.empty((B, Hl, T, D), device=device, dtype=torch.bfloat16)
+
+    # Use same knobs as your decode
+    sink = int(getattr(attn.config, "sink_size", 120))
+    window = int(getattr(attn.config, "window_size", 120))
+    M = int(attn.heavy_const)
+
+    sink = max(0, min(sink, T))
+    window = max(0, min(window, T))
+    M = max(0, min(M, T))
+
+    # Run twice to ensure compilation + any autotune paths complete
     for _ in range(2):
-        _ = sparse_attention_fwd(q, k, v, sparse_list, sparse_len, block_seq=block_seq)
+        sparse_list, sparse_len = build_sparse_list_decode(
+            q_probs,
+            k_hard_bhlt,
+            v_norm_bht,
+            allowed_bht,
+            sink=sink,
+            window=window,
+            M=M,
+            KC=8,
+            BLOCK_N=512,
+            num_warps=8,
+            num_stages=2,
+        )
+
+        if sparse_list.dtype != torch.int32:
+            sparse_list = sparse_list.to(torch.int32)
+        if sparse_len.dtype != torch.int32:
+            sparse_len = sparse_len.to(torch.int32)
+
+        _ = sparse_attention_fwd(
+            q_bhd,
+            k_backend,
+            v_backend,
+            sparse_list,
+            sparse_len,
+            block_seq=block_seq,
+        )
 
     torch.cuda.synchronize()
 
@@ -206,6 +251,7 @@ def generate(
     interactive: bool,
     draft_model: Transformer,
     speculate_k: Optional[int] = 8,
+    decode_type: str = "dense",
     callback = lambda x: x,
     **sampling_kwargs
 ) -> torch.Tensor:
@@ -214,6 +260,9 @@ def generate(
     """
 
     is_speculative = draft_model is not None
+    if is_speculative and decode_type != "dense":
+        print("Warning: sparse decode is not supported for speculative decoding; using dense.")
+        decode_type = "dense"
     # create an empty tensor of the expected final shape and fill in the current tokens
     T = prompt.size(1)
     batch_size = prompt.size(0)
@@ -229,8 +278,10 @@ def generate(
         model.setup_caches(max_batch_size=batch_size, max_seq_length=max_seq_length)
         if is_speculative and draft_model is not model:
             draft_model.setup_caches(max_batch_size=batch_size, max_seq_length=max_seq_length)
-    
-    warmup_triton_sparse_attention(model, torch.device("cuda"), block_seq=256)
+
+    T_warm = min(model.max_seq_length, prompt.size(1)) 
+    print("T_warm:", T_warm)
+    warmup_triton_sparse_decode(model, torch.device("cuda"), T=T_warm, block_seq=256)
     # create an empty tensor of the expected final shape and fill in the current tokens
     empty = torch.empty((batch_size, T_new), dtype=dtype, device=device)
     empty[:,:T] = prompt
@@ -253,7 +304,7 @@ def generate(
     else:
         prefill_start_t = time.perf_counter()
 
-    next_token = prefill(model, prompt, input_pos, "dense", **sampling_kwargs)
+    next_token = prefill(model, prompt, input_pos, decode_type, **sampling_kwargs)
     # model.build_tables(prefill_len=prompt.size(1))
 
     if is_speculative:
@@ -289,7 +340,15 @@ def generate(
             input_pos = input_pos + num_added
             next_token = next_tokens[-1]
     else:
-        generated_tokens, _ = decode_n_tokens(model, next_token, input_pos, max_new_tokens - 1, callback=callback, decode_type="dense", **sampling_kwargs)
+        generated_tokens, _ = decode_n_tokens(
+            model,
+            next_token,
+            input_pos,
+            max_new_tokens - 1,
+            callback=callback,
+            decode_type=decode_type,
+            **sampling_kwargs,
+        )
         seq[:,T + 1:] = torch.cat(generated_tokens, dim=1)
 
     if use_cuda_timing:
@@ -390,6 +449,7 @@ def main(
     profile: Optional[Path] = None,
     draft_checkpoint_path: Optional[Path] = None,
     speculate_k: int = 5,
+    decode_type: str = "dense",
     batch_size: int = 1,
 ) -> None:
     """Generates text samples based on a pre-trained Transformer model and tokenizer.
@@ -498,6 +558,7 @@ def main(
                 speculate_k=speculate_k,
                 interactive=interactive,
                 callback=callback,
+                decode_type=decode_type,
                 temperature=temperature,
                 top_k=top_k,
             )
@@ -546,7 +607,7 @@ if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser(description='Your CLI description.')
 
-    parser.add_argument('--prompt', type=str, default="Hello, my name is", help='Input prompt.')
+    parser.add_argument('--prompt', type=str, default="Write me a 1000 word story on soccer.", help='Input prompt.')
     parser.add_argument('--prompt_file', type=Path, default=None, help='Path to a text file containing the prompt (avoids argument length limits).')
     parser.add_argument('--interactive', action='store_true', help='Whether to launch in interactive mode')
     parser.add_argument('--num_samples', type=int, default=1, help='Number of samples.')
@@ -560,6 +621,7 @@ if __name__ == '__main__':
     parser.add_argument('--speculate_k', type=int, default=5, help='Speculative execution depth.')
     parser.add_argument('--draft_checkpoint_path', type=Path, default=None, help='Draft checkpoint path.')
     parser.add_argument('--batch_size', type=int, default=1, help='Batch Size')
+    parser.add_argument('--decode_type', type=str, default="sparse", choices=["dense", "sparse"], help='Decode path to use for generation.')
 
     args = parser.parse_args()
     main(
@@ -576,5 +638,6 @@ if __name__ == '__main__':
         profile=args.profile,
         draft_checkpoint_path=args.draft_checkpoint_path,
         speculate_k=args.speculate_k,
+        decode_type=args.decode_type,
         batch_size=args.batch_size,
     )

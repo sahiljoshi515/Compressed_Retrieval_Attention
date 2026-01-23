@@ -3,99 +3,14 @@ import torch
 import triton
 import triton.language as tl
 
-# ---------------------------------------------------------
-# Kernel 2: score tokens in blocks and extract top-KC/block
-# Outputs candidates: cand_idx, cand_score
-# cand_idx:   [B, H, NB, KC] int32
-# cand_score: [B, H, NB, KC] fp32
-# ---------------------------------------------------------
-@triton.jit
-def block_candidates_kernel(
-    QPROBS,        # [B, H, L, R] fp16
-    K_HARD,        # [B, H, L, T] int16/int32 (bucket ids)
-    V_NORM,        # [B, H, T] fp16/bf16
-    ALLOWED,       # [B, H, T] bool
-    CAND_IDX,      # [B, H, NB, KC] int32
-    CAND_SCORE,    # [B, H, NB, KC] fp32
-    T: tl.constexpr,
-    stride_qpb, stride_qph, stride_qpl, stride_qpr,
-    stride_khb, stride_khh, stride_khl, stride_kht,
-    stride_vnb, stride_vnh, stride_vnt,
-    stride_ab, stride_ah, stride_at,
-    stride_cib, stride_cih, stride_cinb, stride_cik,
-    stride_csb, stride_csh, stride_csnb, stride_csk,
-    L: tl.constexpr,
-    R: tl.constexpr,
-    BLOCK_N: tl.constexpr,   # tokens per block (pow2 like 256/512)
-    KC: tl.constexpr,        # candidates per block (small, 8/16)
-):
-    b = tl.program_id(0)
-    h = tl.program_id(1)
-    nb = tl.program_id(2)
+_SOFT_HASH_EXT = None
 
-    start = nb * BLOCK_N
-    offs = tl.arange(0, BLOCK_N)  # [BLOCK_N]
-    offs_t = start + offs
-    t_mask = offs_t < T
-
-    # allowed mask
-    allowed = tl.load(
-        ALLOWED + b * stride_ab + h * stride_ah + offs_t * stride_at,
-        mask=t_mask,
-        other=0,
-    ).to(tl.int1)
-
-    # v_norm
-    vnorm = tl.load(
-        V_NORM + b * stride_vnb + h * stride_vnh + offs_t * stride_vnt,
-        mask=t_mask,
-        other=0.0,
-    ).to(tl.float32)
-
-    # score[t] = vnorm[t] * sum_l q_probs[l, k_hard[l,t]]
-    score = tl.zeros([BLOCK_N], dtype=tl.float32)
-
-    for l_id in range(0, L):
-        bkt = tl.load(
-            K_HARD + b * stride_khb + h * stride_khh + l_id * stride_khl + offs_t * stride_kht,
-            mask=t_mask,
-            other=0,
-        ).to(tl.int32)
-
-        # guard invalid buckets (shouldn't happen, but safe)
-        bkt = tl.maximum(0, tl.minimum(bkt, R - 1))
-
-        probs_ptr = QPROBS + b * stride_qpb + h * stride_qph + l_id * stride_qpl + bkt * stride_qpr
-        p = tl.load(probs_ptr, mask=t_mask, other=0.0).to(tl.float32)
-        score += p
-
-    score *= vnorm
-    score = tl.where(t_mask & allowed, score, -float("inf"))
-
-    # NOTE: This iterative argmax is OK for KC<=8/16, but not great for KC>=32.
-    top_idx = tl.zeros([KC], dtype=tl.int32)
-    top_val = tl.zeros([KC], dtype=tl.float32)
-    work = score
-
-    ak = tl.arange(0, KC)
-
-    for ksel in range(0, KC):
-        m = tl.max(work, axis=0)  # scalar
-        is_max = work == m
-        candidate = tl.where(is_max, offs, 1 << 30)
-        arg = tl.min(candidate, axis=0).to(tl.int32)
-        abs_t = start + arg
-
-        top_idx = tl.where(ak == ksel, abs_t, top_idx)
-        top_val = tl.where(ak == ksel, m, top_val)
-        work = tl.where(offs == arg, -float("inf"), work)
-
-    # store
-    offs_k = tl.arange(0, KC)
-    ci_ptr = CAND_IDX + b * stride_cib + h * stride_cih + nb * stride_cinb + offs_k * stride_cik
-    cs_ptr = CAND_SCORE + b * stride_csb + h * stride_csh + nb * stride_csnb + offs_k * stride_csk
-    tl.store(ci_ptr, top_idx, mask=offs_k < KC)
-    tl.store(cs_ptr, top_val, mask=offs_k < KC)
+def _get_soft_hash_ext():
+    global _SOFT_HASH_EXT
+    if _SOFT_HASH_EXT is None:
+        from kernels.soft_hash_collision_loader import load_soft_hash_collision
+        _SOFT_HASH_EXT = load_soft_hash_collision(3)
+    return _SOFT_HASH_EXT
 
 @torch.no_grad()
 def build_sparse_list_decode(
@@ -112,51 +27,35 @@ def build_sparse_list_decode(
     num_stages: int = 2,
 ):
     assert q_probs.is_cuda and k_hard_bhlt.is_cuda and v_norm_bht.is_cuda and allowed_bht.is_cuda
-    assert q_probs.dtype in (torch.float16, torch.bfloat16)
+    assert q_probs.dtype in (torch.float16, torch.bfloat16, torch.float32)
     assert allowed_bht.dtype == torch.bool
 
     B, H, L, R = q_probs.shape
     _, _, L2, T = k_hard_bhlt.shape
     assert L2 == L
 
-    # 2) blockwise candidates
-    NB = (T + BLOCK_N - 1) // BLOCK_N
     device = q_probs.device
-    cand_idx = torch.empty((B, H, NB, KC), device=device, dtype=torch.int32)
-    cand_score = torch.empty((B, H, NB, KC), device=device, dtype=torch.float32)
-
-    grid2 = (B, H, NB)
-
-    block_candidates_kernel[grid2](
-        q_probs,
-        k_hard_bhlt,
-        v_norm_bht,
-        allowed_bht,
-        cand_idx,
-        cand_score,
-        T=T,
-        stride_qpb=q_probs.stride(0), stride_qph=q_probs.stride(1), stride_qpl=q_probs.stride(2), stride_qpr=q_probs.stride(3),
-        stride_khb=k_hard_bhlt.stride(0), stride_khh=k_hard_bhlt.stride(1), stride_khl=k_hard_bhlt.stride(2), stride_kht=k_hard_bhlt.stride(3),
-        stride_vnb=v_norm_bht.stride(0), stride_vnh=v_norm_bht.stride(1), stride_vnt=v_norm_bht.stride(2),
-        stride_ab=allowed_bht.stride(0), stride_ah=allowed_bht.stride(1), stride_at=allowed_bht.stride(2),
-        stride_cib=cand_idx.stride(0), stride_cih=cand_idx.stride(1), stride_cinb=cand_idx.stride(2), stride_cik=cand_idx.stride(3),
-        stride_csb=cand_score.stride(0), stride_csh=cand_score.stride(1), stride_csnb=cand_score.stride(2), stride_csk=cand_score.stride(3),
-        L=L,
-        R=R,
-        BLOCK_N=BLOCK_N,
-        KC=KC,
-        num_warps=num_warps,
-        num_stages=num_stages,
-    )
-
-    # 3) global top-M from candidate pool (NB*KC << T)
-    cand_idx_flat = cand_idx.reshape(B, H, NB * KC)
-    cand_score_flat = cand_score.reshape(B, H, NB * KC)
-
-    M_eff = min(M, NB * KC)
+    # NOTE: KC/BLOCK_N/num_warps/num_stages kept for API compatibility.
+    M_eff = min(M, T)
     if M_eff > 0:
-        top = torch.topk(cand_score_flat, k=M_eff, dim=-1, largest=True)
-        heavy_idx = torch.gather(cand_idx_flat, dim=-1, index=top.indices).to(torch.int32)
+        ext = _get_soft_hash_ext()
+        q_probs_f32 = q_probs.float().unsqueeze(2).contiguous()  # [B,H,1,L,R]
+        key_buckets = k_hard_bhlt
+        if key_buckets.dtype != torch.int16:
+            key_buckets = key_buckets.to(torch.int16)
+        key_buckets = key_buckets.contiguous()
+        allowed_ext = allowed_bht.unsqueeze(2).contiguous()       # [B,H,1,T]
+        v_hist = v_norm_bht.float().unsqueeze(2).contiguous()     # [B,H,1,T]
+
+        scores = ext.soft_hash_collision(
+            q_probs_f32,
+            key_buckets,
+            allowed_ext,
+            v_hist,
+        ).squeeze(2)  # [B,H,T]
+
+        top = torch.topk(scores, k=M_eff, dim=-1, largest=True)
+        heavy_idx = top.indices.to(torch.int32)
     else:
         heavy_idx = torch.empty((B, H, 0), device=device, dtype=torch.int32)
 
@@ -194,7 +93,6 @@ def build_sparse_list_decode(
     sparse_list = torch.cat([base, heavy_idx], dim=-1).contiguous()
     sparse_len = torch.full((B, H), sparse_list.shape[-1], device=device, dtype=torch.int32)
     return sparse_list, sparse_len
-
 
 
 # =========================================================
@@ -429,4 +327,3 @@ def sparse_attention_fwd(
     sparse_decode_stage1(query, key, value, sparse_list, sparse_len, max_len_in_batch, mid_o, mid_o_log, block_seq)
     sparse_decode_stage2(mid_o, mid_o_log, sparse_len, out, block_seq)
     return out
-
