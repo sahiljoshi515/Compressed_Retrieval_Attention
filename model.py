@@ -102,7 +102,7 @@ def _prof_print(attn_obj, prefix="[tok-sparse prof] ", reset=True):
 
 @dataclass
 class ModelArgs:
-    block_size: int = 128000
+    block_size: int = 300000
     vocab_size: int = 32000
     n_layer: int = 1
     n_head: int = 32
@@ -115,7 +115,7 @@ class ModelArgs:
     L: int = 60
     R: int = 1024
     K: int = 10
-    heavy_const: int = 80  # budget
+    heavy_const: int = 3600  # budget
 
     def __post_init__(self):
         if self.n_local_heads == -1:
@@ -137,7 +137,7 @@ class ModelArgs:
 
 transformer_configs = {
     "CodeLlama-7b-Python-hf": dict(block_size=16384, vocab_size=32000, n_layer=1, dim=4096, rope_base=1000000),
-    "Llama-2-7b-chat-hf": dict(block_size=128000, vocab_size=32000, n_layer=1, n_head=32, dim=4096, rope_base=10000),
+    "Llama-2-7b-chat-hf": dict(block_size=300000, vocab_size=32000, n_layer=1, n_head=32, dim=4096, rope_base=10000),
     "7B": dict(n_layer=1, n_head=32, dim=4096),
     "13B": dict(n_layer=1, n_head=40, dim=5120),
     "30B": dict(n_layer=1, n_head=52, dim=6656),
@@ -325,7 +325,7 @@ class Transformer(nn.Module):
         for layer in self.layers:
             x = layer.sparse_forward(x, input_pos, freqs_cis, mask)
         x = self.norm(x)
-        self.layers[0].attention.print_prof(reset=True)
+        # self.layers[0].attention.print_prof(reset=True)
         return self.output(x)
 
     @classmethod
@@ -428,7 +428,7 @@ class Attention(nn.Module):
         assert self.kv_cache is not None, "Call setup_caches() first so kv_cache exists"
 
         p = self._prof
-        cuda_timing = True
+        cuda_timing = False
 
         # QKV + RoPE
         with CUDATimer(cuda_timing) as t_qkv:
@@ -484,7 +484,8 @@ class Attention(nn.Module):
         assert T > 0
 
 
-        # allowed_bht = mask1[..., :T].expand(bsz, self.n_head, 1, T).squeeze(2).contiguous()  # [B,H,T]
+        # allowed_bt = mask1[0, 0, :, :T]     # [B,T]  True=allowed
+        # allowed_bht = allowed_bt[:, None, :].expand(bsz, self.n_head, T).contiguous()
 
         pos = input_pos.view(-1)
         allowed = torch.arange(T, device=pos.device) <= pos.max()
@@ -507,8 +508,8 @@ class Attention(nn.Module):
             q_bhd = q_sdpa[:, :, 0, :].contiguous()  # [B,H,D]
         p["kv_relayout"] += t_relayout.ms()
 
-        sink = int(getattr(self.config, "sink_size", 20))
-        window = int(getattr(self.config, "window_size", 20))
+        sink = int(getattr(self.config, "sink_size", 120))
+        window = int(getattr(self.config, "window_size", 120))
         M = int(self.heavy_const)
         sink = max(0, min(sink, T))
         window = max(0, min(window, T))

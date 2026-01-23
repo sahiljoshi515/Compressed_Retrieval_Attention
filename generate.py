@@ -69,8 +69,8 @@ def warmup_triton_sparse_decode(model: Transformer, device: torch.device, *, T: 
     v_backend = torch.empty((B, Hl, T, D), device=device, dtype=torch.bfloat16)
 
     # Use same knobs as your decode
-    sink = int(getattr(attn.config, "sink_size", 20))
-    window = int(getattr(attn.config, "window_size", 20))
+    sink = int(getattr(attn.config, "sink_size", 120))
+    window = int(getattr(attn.config, "window_size", 120))
     M = int(attn.heavy_const)
 
     sink = max(0, min(sink, T))
@@ -621,7 +621,7 @@ if __name__ == '__main__':
     parser.add_argument('--speculate_k', type=int, default=5, help='Speculative execution depth.')
     parser.add_argument('--draft_checkpoint_path', type=Path, default=None, help='Draft checkpoint path.')
     parser.add_argument('--batch_size', type=int, default=1, help='Batch Size')
-    parser.add_argument('--decode_type', type=str, default="dense", choices=["dense", "sparse"], help='Decode path to use for generation.')
+    parser.add_argument('--decode_type', type=str, default="sparse", choices=["dense", "sparse"], help='Decode path to use for generation.')
 
     args = parser.parse_args()
     main(
