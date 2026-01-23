@@ -483,7 +483,12 @@ class Attention(nn.Module):
         T = int(self.kv_cache.prefill_len.item())
         assert T > 0
 
-        allowed_bht = mask1[..., :T].expand(bsz, self.n_head, 1, T).squeeze(2).contiguous()  # [B,H,T]
+
+        # allowed_bht = mask1[..., :T].expand(bsz, self.n_head, 1, T).squeeze(2).contiguous()  # [B,H,T]
+
+        pos = input_pos.view(-1)
+        allowed = torch.arange(T, device=pos.device) <= pos.max()
+        allowed_bht = allowed.view(1, 1, T).expand(bsz, self.n_head, T).contiguous()
 
         with CUDATimer(cuda_timing) as t_relayout:
             # k_hard: [B,Hl,T,L] -> [B,H,L,T]
